@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy
+matplotlib
+google-api-python-client
+openai
+tqdm
