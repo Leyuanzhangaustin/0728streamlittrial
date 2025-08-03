@@ -120,6 +120,10 @@ def movie_comment_analysis(
         f'"{movie_title}" 好唔好睇',
         f'"{movie_title}" 討論',
         f'"{movie_title}" reaction'
+        f'"{movie_title}" 電影',
+        f'"{movie_title}" 上映',
+        f'"{movie_title}" 《》',
+        f'"{movie_title}" <>',
     ]
     # API初始化
     from googleapiclient.discovery import build
