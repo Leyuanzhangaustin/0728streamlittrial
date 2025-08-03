@@ -6,6 +6,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import time
+import re
+
+# ========== 检查是否为繁体中文 ==========
+def is_traditional_chinese(text):
+    """
+    Returns True if text is mostly Traditional Chinese.
+    Simple heuristic: if there are more Traditional than Simplified chars, treat as Traditional.
+    """
+    # 常见简体字集合
+    simplified_chars = set("们体为产举乐乡书买乱争亚伪众优会传伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价众优伤伦体价")
+    traditional_chars = set("們體為產舉樂鄉書買亂爭亞偽眾優會傳傷倫體價")
+    # 统计出现的繁简体字符数
+    simplified_count = sum(1 for c in text if c in simplified_chars)
+    traditional_count = sum(1 for c in text if c in traditional_chars)
+    # 若繁体字符多于简体字符，则视为繁体
+    return traditional_count >= simplified_count and traditional_count > 0
 
 # ========== 1. YouTube 搜索 ==========
 def search_youtube_videos(keywords, youtube_client, max_per_keyword, start_date, end_date):
@@ -134,6 +150,10 @@ def movie_comment_analysis(
     df_comments = df_comments.loc[mask].reset_index(drop=True)
     if df_comments.empty:
         return None, "没有符合日期范围的评论"
+    # ------ 新增: 过滤非繁体评论 ------
+    df_comments = df_comments[df_comments['comment_text'].apply(is_traditional_chinese)].reset_index(drop=True)
+    if df_comments.empty:
+        return None, "没有符合条件的繁体中文评论"
     # 抽样
     if sample_size and sample_size < len(df_comments):
         df_analyze = df_comments.sample(n=sample_size, random_state=42)
@@ -193,7 +213,7 @@ if st.button("🚀 开始分析"):
 
             # ========== 可视化 (Visualization in English) ==========
             st.subheader("1. Sentiment Distribution")
-            fig1, ax1 = plt.subplots(figsize=(4, 4))  # Smaller pie chart
+            fig1, ax1 = plt.subplots(figsize=(4, 4))
             valmap = {
                 "Positive": "Positive",
                 "Negative": "Negative",
