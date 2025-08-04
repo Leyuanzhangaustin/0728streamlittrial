@@ -1,5 +1,5 @@
 # app.py
-
+pip install opencc-python-reimplemented
 import streamlit as st
 import pandas as pd
 import numpy as np
