@@ -1,5 +1,5 @@
 # app.py
-pip install opencc-python-reimplemented
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,7 +9,7 @@ import time
 import json
 import openai
 from googleapiclient.discovery import build
-
+pip install opencc-python-reimplemented
 # ==============================================================================
 # 1. 優化後的關鍵詞生成策略
 # ==============================================================================
