@@ -1,7 +1,14 @@
-streamlit
-pandas
-numpy
-matplotlib
-google-api-python-client
-openai
-tqdm
+# Streamlit and Data Handling
+streamlit>=1.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Plotting
+matplotlib>=3.7.0
+
+# API Clients
+google-api-python-client>=2.90.0
+openai>=1.10.0
+
+# Utilities
+tqdm>=4.65.0
