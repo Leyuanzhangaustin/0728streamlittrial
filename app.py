@@ -37,8 +37,13 @@ def get_all_comments(video_ids, youtube_client, max_per_video):
     all_comments = []
     for video_id in video_ids:
         try:
+            # Request comments sorted by 'time' (newest first)
             request = youtube_client.commentThreads().list(
-                part='snippet', videoId=video_id, textFormat='plainText', maxResults=100
+                part='snippet',
+                videoId=video_id,
+                textFormat='plainText',
+                maxResults=100,
+                order='time'  # <<< CRITICAL CHANGE: Sort by newest first
             )
             comments_fetched = 0
             while request and comments_fetched < max_per_video:
@@ -56,9 +61,13 @@ def get_all_comments(video_ids, youtube_client, max_per_video):
                     comments_fetched += 1
                 if comments_fetched >= max_per_video:
                     break
-                request = youtube_client.commentThreads().list_next(request, response)
+                # Check if there is a next page
+                if 'nextPageToken' in response:
+                    request = youtube_client.commentThreads().list_next(request, response)
+                else:
+                    request = None # No more pages
         except Exception as e:
-            # Silently continue if comments are disabled, etc.
+            # Silently continue if comments are disabled or other errors occur
             continue
     return pd.DataFrame(all_comments)
 
