@@ -314,4 +314,3 @@ if st.button("🚀 開始分析"):
                 csv,
                 file_name=f"{movie_title}_analysis_details.csv",
                 mime='text/csv'
-            )
