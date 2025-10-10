@@ -25,7 +25,7 @@ def search_youtube_videos(keywords, youtube_client, max_per_keyword, start_date,
             ).execute()
             video_ids = [item['id']['videoId'] for item in search_response.get('items', [])]
             all_video_ids.update(video_ids)
-            time.sleep(0.5)  # Keep a small delay to be nice to YouTube API
+            time.sleep(0.5)
         except Exception as e:
             st.warning(f"搜尋關鍵字 '{query}' 時發生錯誤: {e}")
             continue
@@ -206,106 +206,121 @@ if st.button("🚀 開始分析"):
             st.success("分析完成！")
             st.dataframe(df_result.head(20))
 
-            st.subheader("1. 情感分佈圓餅圖")
-            fig1, ax1 = plt.subplots(figsize=(5, 4))
-            valmap = {
-                "Positive": "正面", "Negative": "負面", "Neutral": "中性",
-                "Invalid": "無效", "Error": "錯誤"
+            sentiments_order = ['Positive', 'Negative', 'Neutral', 'Invalid', 'Error']
+            colors_map = {
+                'Positive': '#5cb85c',
+                'Negative': '#d9534f',
+                'Neutral': '#f0ad4e',
+                'Invalid': '#cccccc',
+                'Error': '#888888'
             }
-            df_result['sentiment_cn'] = df_result['sentiment'].map(lambda x: valmap.get(str(x), str(x)))
-            s_counts = df_result['sentiment_cn'].value_counts()
-            order = ['正面', '負面', '中性', '無效', '錯誤']
-            colors_map = {'正面': '#5cb85c', '負面': '#d9534f', '中性': '#f0ad4e', '無效': '#cccccc', '錯誤': '#888888'}
-            s_counts = s_counts.reindex(order).dropna()
 
-            s_counts.plot.pie(
-                autopct='%.1f%%', ax=ax1,
-                colors=[colors_map[key] for key in s_counts.index],
-                wedgeprops={'linewidth': 1.0, 'edgecolor': 'white'}
-            )
-            ax1.set_title('整體情感分佈', fontsize=16)
-            ax1.set_ylabel('')
-            st.pyplot(fig1, use_container_width=False)
+            st.subheader("1. Sentiment Distribution (Pie)")
+            sentiment_series = df_result['sentiment'].dropna().astype(str)
+            sentiment_counts = sentiment_series.value_counts()
+            ordered_labels = [label for label in sentiments_order if label in sentiment_counts.index]
 
-            st.subheader("2. 每日情感趨勢 (堆疊長條圖)")
-            df_result['date'] = df_result['published_at_hk'].dt.floor('D')
-            daily = df_result.groupby(['date', 'sentiment_cn']).size().unstack().fillna(0)
-            daily = daily.reindex(columns=order).dropna(axis=1, how='all')
-            daily = daily.sort_index()
-            daily.index = pd.to_datetime(daily.index)
-
-            fig2, ax2 = plt.subplots(figsize=(12, 4))
-
-            daily_plot_df = daily.reset_index()
-            dates = daily_plot_df['date'].to_list()
-            bottom = np.zeros(len(dates))
-
-            for sentiment in daily.columns:
-                values = daily_plot_df[sentiment].to_numpy()
-                if np.any(values):
-                    ax2.bar(
-                        dates,
-                        values,
-                        bottom=bottom,
-                        width=0.8,
-                        color=colors_map.get(sentiment, '#999999'),
-                        label=sentiment
-                    )
-                    bottom += values
-
-            ax2.set_title('每日情感趨勢', fontsize=16)
-            ax2.set_xlabel('日期')
-            ax2.set_ylabel('留言數量')
-
-            num_dates = len(dates)
-            if num_dates > 0:
-                if num_dates > 20:
-                    interval = max(5, int(np.ceil(num_dates / 12)))
-                else:
-                    interval = 1
-
-                locator = mdates.DayLocator(interval=interval)
-                formatter = mdates.DateFormatter('%Y-%m-%d')
-                ax2.xaxis.set_major_locator(locator)
-                ax2.xaxis.set_major_formatter(formatter)
-
-                # 確保最後一天一定出現在刻度上
-                if num_dates > 1:
-                    last_date = dates[-1]
-                    tick_dates = locator.tick_values(dates[0], dates[-1])
-                    if last_date not in pd.to_datetime(tick_dates):
-                        ax2.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=13))
-                        ax2.xaxis.set_major_formatter(formatter)
-
-                plt.setp(ax2.get_xticklabels(), rotation=45, ha='right', fontsize=9)
-                ax2.set_xlim(dates[0] - pd.Timedelta(days=0.5), dates[-1] + pd.Timedelta(days=0.5))
+            if ordered_labels:
+                fig1, ax1 = plt.subplots(figsize=(5, 4))
+                values = sentiment_counts[ordered_labels].values
+                colors = [colors_map[label] for label in ordered_labels]
+                ax1.pie(
+                    values,
+                    labels=ordered_labels,
+                    autopct='%.1f%%',
+                    colors=colors,
+                    wedgeprops={'linewidth': 1.0, 'edgecolor': 'white'}
+                )
+                ax1.set_title('Overall Sentiment Distribution', fontsize=16)
+                st.pyplot(fig1, use_container_width=False)
             else:
-                ax2.set_xticks([])
+                st.info("No sentiment data available for visualization.")
 
-            ax2.legend(title='情感')
-            fig2.subplots_adjust(bottom=0.28)
-            st.pyplot(fig2, use_container_width=True)
+            st.subheader("2. Daily Sentiment Trend (Stacked Bar)")
+            if 'published_at_hk' in df_result.columns:
+                df_result['date'] = df_result['published_at_hk'].dt.floor('D')
+            else:
+                df_result['date'] = df_result['published_at'].dt.floor('D')
 
-            st.subheader("3. 各主題情感佔比")
-            topic_sentiment = df_result.groupby(['topic', 'sentiment_cn']).size().unstack().fillna(0)
-            topic_sentiment = topic_sentiment.reindex(columns=order).dropna(axis=1, how='all')
-            topic_sentiment_percent = topic_sentiment.div(topic_sentiment.sum(axis=1), axis=0) * 100
+            daily = df_result.groupby(['date', 'sentiment']).size().unstack().fillna(0)
+            available_sentiments = [label for label in sentiments_order if label in daily.columns]
+            daily = daily[available_sentiments] if available_sentiments else daily
 
-            fig3, ax3 = plt.subplots(figsize=(10, 5))
-            topic_sentiment_percent.plot(
-                kind='bar',
-                stacked=True,
-                ax=ax3,
-                color=[colors_map[col] for col in topic_sentiment_percent.columns]
-            )
-            ax3.set_title('各討論主題的情感佔比', fontsize=16)
-            ax3.set_xlabel('主題')
-            ax3.set_ylabel('百分比 (%)')
-            ax3.yaxis.set_major_formatter(plt.FuncFormatter('{:.0f}%'.format))
-            plt.xticks(rotation=45, ha='right')
-            ax3.legend(title='情感')
-            plt.tight_layout()
-            st.pyplot(fig3, use_container_width=True)
+            if not daily.empty and available_sentiments:
+                daily = daily.sort_index()
+                daily_plot_df = daily.reset_index()
+                daily_plot_df['date'] = pd.to_datetime(daily_plot_df['date'])
+                dates = daily_plot_df['date'].dt.to_pydatetime().tolist()
+
+                fig2, ax2 = plt.subplots(figsize=(12, 4))
+                bottom = np.zeros(len(dates))
+
+                for sentiment in available_sentiments:
+                    values = daily_plot_df[sentiment].to_numpy()
+                    if np.any(values):
+                        ax2.bar(
+                            dates,
+                            values,
+                            bottom=bottom,
+                            width=0.8,
+                            color=colors_map.get(sentiment, '#999999'),
+                            label=sentiment
+                        )
+                        bottom += values
+
+                ax2.set_title('Daily Comment Volume by Sentiment', fontsize=16)
+                ax2.set_xlabel('Date')
+                ax2.set_ylabel('Number of Comments')
+
+                num_dates = len(dates)
+                if num_dates > 0:
+                    if num_dates > 20:
+                        tick_dates = pd.date_range(dates[0], dates[-1], freq='7D').to_pydatetime().tolist()
+                        if not tick_dates:
+                            tick_dates = [dates[0]]
+                        if tick_dates[-1] != dates[-1]:
+                            tick_dates.append(dates[-1])
+                        ax2.set_xticks(tick_dates)
+                    else:
+                        ax2.set_xticks(dates)
+
+                    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+                    plt.setp(ax2.get_xticklabels(), rotation=45, ha='right', fontsize=9)
+                    ax2.set_xlim(dates[0] - timedelta(days=0.5), dates[-1] + timedelta(days=0.5))
+                else:
+                    ax2.set_xticks([])
+
+                ax2.legend(title='Sentiment')
+                fig2.subplots_adjust(bottom=0.28)
+                st.pyplot(fig2, use_container_width=True)
+            else:
+                st.info("Not enough daily sentiment data to display the trend chart.")
+
+            st.subheader("3. Sentiment Share by Topic")
+            topic_sentiment = df_result.groupby(['topic', 'sentiment']).size().unstack().fillna(0)
+            available_sentiments_topic = [label for label in sentiments_order if label in topic_sentiment.columns]
+            topic_sentiment = topic_sentiment[available_sentiments_topic] if available_sentiments_topic else topic_sentiment
+
+            if not topic_sentiment.empty and available_sentiments_topic:
+                topic_sentiment_percent = topic_sentiment.div(topic_sentiment.sum(axis=1), axis=0).fillna(0) * 100
+
+                fig3, ax3 = plt.subplots(figsize=(10, 5))
+                topic_sentiment_percent[available_sentiments_topic].plot(
+                    kind='bar',
+                    stacked=True,
+                    ax=ax3,
+                    color=[colors_map[label] for label in available_sentiments_topic]
+                )
+                ax3.set_title('Sentiment Share by Topic', fontsize=16)
+                ax3.set_xlabel('Topic')
+                ax3.set_ylabel('Percentage (%)')
+                ax3.yaxis.set_major_formatter(plt.FuncFormatter('{:.0f}%'.format))
+                plt.xticks(rotation=45, ha='right')
+                ax3.legend(title='Sentiment')
+                plt.tight_layout()
+                st.pyplot(fig3, use_container_width=True)
+            else:
+                st.info("Not enough topic sentiment data to display the stacked bar chart.")
 
             st.subheader("4. 下載分析明細")
             csv = df_result.to_csv(index=False, encoding='utf-8-sig')
@@ -314,3 +329,4 @@ if st.button("🚀 開始分析"):
                 csv,
                 file_name=f"{movie_title}_analysis_details.csv",
                 mime='text/csv'
+            )
