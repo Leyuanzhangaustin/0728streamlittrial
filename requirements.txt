@@ -5,6 +5,7 @@ numpy>=1.24.0
 
 # Plotting
 matplotlib>=3.7.0
+plotly>=5.10.0  # <<< 新增這一行
 
 # API Clients
 google-api-python-client>=2.90.0
