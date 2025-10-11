@@ -1,8 +1,11 @@
+# app.py (Corrected and Optimized Visualization Version)
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import plotly.express as px  # <<< MODIFIED: 確保引入 Plotly
 from datetime import datetime, timedelta
 import time
 import asyncio
@@ -60,7 +63,7 @@ def get_all_comments(video_ids, youtube_client, max_per_video):
             continue
     return pd.DataFrame(all_comments)
 
-# ========== 3. DeepSeek AI Sentiment Analysis (Async) ==========
+# ========== 3. DeepSeek AI Sentiment Analysis (No changes) ==========
 async def analyze_comment_deepseek_async(comment_text, deepseek_client, semaphore, max_retries=3):
     import json
     if not isinstance(comment_text, str) or len(comment_text.strip()) < 5:
@@ -97,7 +100,7 @@ async def analyze_comment_deepseek_async(comment_text, deepseek_client, semaphor
                 else:
                     return {"sentiment": "Error", "topic": "Error", "summary": f"API Error: {e}"}
 
-# ========== 4. Main Process (Async Coordinator) ==========
+# ========== 4. Main Process (No changes) ==========
 async def run_all_analyses(df, deepseek_client):
     semaphore = asyncio.Semaphore(50)
     tasks = [
@@ -161,7 +164,7 @@ def movie_comment_analysis(
     final_df['published_at'] = pd.to_datetime(final_df['published_at'])
     return final_df, None
 
-# ========== 5. Streamlit UI ==========
+# ========== 5. Streamlit UI (No changes in this part) ==========
 st.set_page_config(page_title="YouTube 電影評論 AI 分析", layout="wide")
 st.title("🎬 YouTube 電影評論 AI 情感分析")
 
@@ -191,8 +194,6 @@ if st.button("🚀 開始分析"):
     if not all([movie_title, yt_api_key, deepseek_api_key]):
         st.warning("請填寫電影名稱和兩個 API 金鑰。")
     else:
-        progress_placeholder = st.empty()
-
         with st.spinner("AI 高速分析中... (處理 500 則留言約需 1-2 分鐘)"):
             df_result, err = movie_comment_analysis(
                 movie_title, str(start_date), str(end_date),
@@ -205,123 +206,134 @@ if st.button("🚀 開始分析"):
         else:
             st.success("分析完成！")
             st.dataframe(df_result.head(20))
+            
+            st.header("📊 可視化分析結果")
 
+            # --- 共用設定 ---
             sentiments_order = ['Positive', 'Negative', 'Neutral', 'Invalid', 'Error']
             colors_map = {
-                'Positive': '#5cb85c',
-                'Negative': '#d9534f',
-                'Neutral': '#f0ad4e',
-                'Invalid': '#cccccc',
-                'Error': '#888888'
+                'Positive': '#5cb85c', 'Negative': '#d9534f', 'Neutral': '#f0ad4e',
+                'Invalid': '#cccccc', 'Error': '#888888'
             }
 
+            # --- 1. 情感分佈圓餅圖 (您的版本，可正常運作) ---
             st.subheader("1. Sentiment Distribution (Pie)")
             sentiment_series = df_result['sentiment'].dropna().astype(str)
             sentiment_counts = sentiment_series.value_counts()
             ordered_labels = [label for label in sentiments_order if label in sentiment_counts.index]
 
-            if ordered_labels:
+            if not sentiment_counts.empty:
                 fig1, ax1 = plt.subplots(figsize=(5, 4))
-                values = sentiment_counts[ordered_labels].values
-                colors = [colors_map[label] for label in ordered_labels]
                 ax1.pie(
-                    values,
+                    sentiment_counts[ordered_labels],
                     labels=ordered_labels,
                     autopct='%.1f%%',
-                    colors=colors,
+                    colors=[colors_map[label] for label in ordered_labels],
                     wedgeprops={'linewidth': 1.0, 'edgecolor': 'white'}
                 )
                 ax1.set_title('Overall Sentiment Distribution', fontsize=16)
                 st.pyplot(fig1, use_container_width=False)
             else:
-                st.info("No sentiment data available for visualization.")
+                st.info("No sentiment data available for pie chart.")
 
-            st.subheader("2. Daily Sentiment Trend (Stacked Bar)")
+            # <<< MODIFIED BLOCK START: 修正並優化每日趨勢圖 >>>
+
+            # --- 每日趨勢圖的數據準備 (使用更穩健的 reindex) ---
             if 'published_at_hk' in df_result.columns:
-                df_result['date'] = df_result['published_at_hk'].dt.floor('D')
+                df_result['date'] = df_result['published_at_hk'].dt.date
             else:
-                df_result['date'] = df_result['published_at'].dt.floor('D')
-
+                df_result['date'] = df_result['published_at'].dt.date
+            
             daily = df_result.groupby(['date', 'sentiment']).size().unstack().fillna(0)
-            available_sentiments = [label for label in sentiments_order if label in daily.columns]
-            daily = daily[available_sentiments] if available_sentiments else daily
+            # 使用 reindex 確保所有情感類別都存在且順序正確，即使某些類別沒有數據
+            daily = daily.reindex(columns=sentiments_order).dropna(axis=1, how='all')
 
-            if not daily.empty and available_sentiments:
-                daily = daily.sort_index()
-                daily_plot_df = daily.reset_index()
-                daily_plot_df['date'] = pd.to_datetime(daily_plot_df['date'])
-                dates = daily_plot_df['date'].dt.to_pydatetime().tolist()
+            if not daily.empty:
+                # --- 2a. 每日情感趨勢 (方案一：互動式 Plotly 圖表 - 推薦) ---
+                st.subheader("2. Daily Sentiment Trend (Interactive Chart)")
+                st.markdown("**(推薦)** 此圖表可縮放、平移和懸停查看數據，完美解決標籤擁擠問題。")
+                
+                # Plotly 需要 "long-form" data，所以進行轉換
+                daily_long = daily.reset_index().melt(id_vars='date', var_name='sentiment', value_name='count')
+                
+                fig_plotly = px.area(
+                    daily_long,
+                    x='date',
+                    y='count',
+                    color='sentiment',
+                    title='Daily Comment Volume by Sentiment',
+                    labels={'date': 'Date', 'count': 'Number of Comments', 'sentiment': 'Sentiment'},
+                    color_discrete_map=colors_map,
+                    category_orders={'sentiment': [col for col in sentiments_order if col in daily.columns]}
+                )
+                fig_plotly.update_layout(legend_title_text='Sentiment')
+                st.plotly_chart(fig_plotly, use_container_width=True)
 
-                fig2, ax2 = plt.subplots(figsize=(12, 4))
-                bottom = np.zeros(len(dates))
-
-                for sentiment in available_sentiments:
-                    values = daily_plot_df[sentiment].to_numpy()
-                    if np.any(values):
-                        ax2.bar(
-                            dates,
-                            values,
-                            bottom=bottom,
-                            width=0.8,
-                            color=colors_map.get(sentiment, '#999999'),
-                            label=sentiment
-                        )
-                        bottom += values
-
-                ax2.set_title('Daily Comment Volume by Sentiment', fontsize=16)
-                ax2.set_xlabel('Date')
-                ax2.set_ylabel('Number of Comments')
-
-                num_dates = len(dates)
-                if num_dates > 0:
-                    if num_dates > 20:
-                        tick_dates = pd.date_range(dates[0], dates[-1], freq='7D').to_pydatetime().tolist()
-                        if not tick_dates:
-                            tick_dates = [dates[0]]
-                        if tick_dates[-1] != dates[-1]:
-                            tick_dates.append(dates[-1])
-                        ax2.set_xticks(tick_dates)
-                    else:
-                        ax2.set_xticks(dates)
-
-                    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-                    plt.setp(ax2.get_xticklabels(), rotation=45, ha='right', fontsize=9)
-                    ax2.set_xlim(dates[0] - timedelta(days=0.5), dates[-1] + timedelta(days=0.5))
-                else:
-                    ax2.set_xticks([])
-
-                ax2.legend(title='Sentiment')
-                fig2.subplots_adjust(bottom=0.28)
-                st.pyplot(fig2, use_container_width=True)
+                # --- 2b. 每日情感趨勢 (方案二：優化 Matplotlib 靜態圖) ---
+                with st.expander("查看靜態 Matplotlib 優化圖表"):
+                    st.markdown("此為使用 Matplotlib 繪製的靜態堆疊面積圖，透過智慧日期格式化解決了標籤重疊問題。")
+                    
+                    fig2, ax2 = plt.subplots(figsize=(12, 5))
+                    
+                    # 使用 Pandas 內建的 plot 功能，更簡潔穩健
+                    daily.plot(kind='area', stacked=True, ax=ax2, 
+                               color=[colors_map[col] for col in daily.columns],
+                               linewidth=0.5)
+                    
+                    ax2.set_title('Daily Comment Volume by Sentiment (Static)', fontsize=16)
+                    ax2.set_xlabel('Date')
+                    ax2.set_ylabel('Number of Comments')
+                    
+                    # 核心優化：使用自動日期定位器和格式化器
+                    locator = mdates.AutoDateLocator(minticks=5, maxticks=12)
+                    formatter = mdates.ConciseDateFormatter(locator)
+                    ax2.xaxis.set_major_locator(locator)
+                    ax2.xaxis.set_major_formatter(formatter)
+                    
+                    ax2.legend(title='Sentiment')
+                    ax2.grid(True, which='major', axis='y', linestyle='--', alpha=0.6)
+                    fig2.autofmt_xdate()
+                    plt.tight_layout()
+                    st.pyplot(fig2, use_container_width=True)
             else:
                 st.info("Not enough daily sentiment data to display the trend chart.")
 
+            # <<< MODIFIED BLOCK END >>>
+
+            # --- 3. 各主題情感佔比 (您的版本，稍作穩健性修改) ---
             st.subheader("3. Sentiment Share by Topic")
             topic_sentiment = df_result.groupby(['topic', 'sentiment']).size().unstack().fillna(0)
-            available_sentiments_topic = [label for label in sentiments_order if label in topic_sentiment.columns]
-            topic_sentiment = topic_sentiment[available_sentiments_topic] if available_sentiments_topic else topic_sentiment
+            # 同樣使用 reindex 確保欄位和順序
+            topic_sentiment = topic_sentiment.reindex(columns=sentiments_order).dropna(axis=1, how='all')
+            
+            if not topic_sentiment.empty:
+                # 過濾掉總和為0的主題，避免除以零的錯誤
+                topic_sentiment = topic_sentiment[topic_sentiment.sum(axis=1) > 0]
+                
+                if not topic_sentiment.empty:
+                    topic_sentiment_percent = topic_sentiment.div(topic_sentiment.sum(axis=1), axis=0).fillna(0) * 100
 
-            if not topic_sentiment.empty and available_sentiments_topic:
-                topic_sentiment_percent = topic_sentiment.div(topic_sentiment.sum(axis=1), axis=0).fillna(0) * 100
-
-                fig3, ax3 = plt.subplots(figsize=(10, 5))
-                topic_sentiment_percent[available_sentiments_topic].plot(
-                    kind='bar',
-                    stacked=True,
-                    ax=ax3,
-                    color=[colors_map[label] for label in available_sentiments_topic]
-                )
-                ax3.set_title('Sentiment Share by Topic', fontsize=16)
-                ax3.set_xlabel('Topic')
-                ax3.set_ylabel('Percentage (%)')
-                ax3.yaxis.set_major_formatter(plt.FuncFormatter('{:.0f}%'.format))
-                plt.xticks(rotation=45, ha='right')
-                ax3.legend(title='Sentiment')
-                plt.tight_layout()
-                st.pyplot(fig3, use_container_width=True)
+                    fig3, ax3 = plt.subplots(figsize=(10, 5))
+                    topic_sentiment_percent.plot(
+                        kind='bar',
+                        stacked=True,
+                        ax=ax3,
+                        color=[colors_map[col] for col in topic_sentiment_percent.columns]
+                    )
+                    ax3.set_title('Sentiment Share by Topic', fontsize=16)
+                    ax3.set_xlabel('Topic')
+                    ax3.set_ylabel('Percentage (%)')
+                    ax3.yaxis.set_major_formatter(plt.FuncFormatter('{:.0f}%'.format))
+                    plt.xticks(rotation=45, ha='right')
+                    ax3.legend(title='Sentiment')
+                    plt.tight_layout()
+                    st.pyplot(fig3, use_container_width=True)
+                else:
+                    st.info("No topic data with comments to display the chart.")
             else:
                 st.info("Not enough topic sentiment data to display the stacked bar chart.")
 
+            # --- 4. 下載分析明細 (No changes) ---
             st.subheader("4. 下載分析明細")
             csv = df_result.to_csv(index=False, encoding='utf-8-sig')
             st.download_button(
