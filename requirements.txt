@@ -1,3 +1,4 @@
+
 # Streamlit and Data Handling
 streamlit>=1.30.0
 pandas>=2.0.0
@@ -5,7 +6,7 @@ numpy>=1.24.0
 
 # Plotting
 matplotlib>=3.7.0
-plotly>=5.10.0  # <<< 新增這一行
+plotly>=5.10.0
 
 # API Clients
 google-api-python-client>=2.90.0
@@ -13,3 +14,4 @@ openai>=1.10.0
 
 # Utilities
 tqdm>=4.65.0
+langdetect>=1.0.9  # <<< 新增這一行，用於留言語言偵測
