@@ -1,3 +1,4 @@
+# requirements.txt
 
 # Streamlit and Data Handling
 streamlit>=1.30.0
@@ -12,6 +13,8 @@ plotly>=5.10.0
 google-api-python-client>=2.90.0
 openai>=1.10.0
 
-# Utilities
+# Chinese Language Processing (NEW)
+opencc-python-reimplemented>=0.1.7
+
+# Utilities (tqdm is no longer used in the app but can be kept)
 tqdm>=4.65.0
-langdetect>=1.0.9  # <<< 新增這一行，用於留言語言偵測
