@@ -14,4 +14,4 @@ openai>=1.10.0
 
 # Utilities
 tqdm>=4.65.0
-
+langdetect>=1.0.9  # <<< 新增這一行，用於留言語言偵測
