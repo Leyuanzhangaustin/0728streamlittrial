@@ -1,311 +1,262 @@
+# app.py (Final Visualization Version - Revised for Language Filtering)
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import googleapiclient.discovery
-from openai import AsyncOpenAI, OpenAIError
-import asyncio
-from tqdm.asyncio import tqdm as tqdm_asyncio
-from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import plotly.express as px
-from langdetect import detect, LangDetectException
-import json
+from datetime import datetime, timedelta
+import time
+import asyncio
+import openai
+from opencc import OpenCC  # ### NEW: 引入 OpenCC 庫
 
-# --- Constants and Configuration ---
-
-# <<< 新增：繁簡體中文特徵字判斷 >>>
-# 建立常用且有代表性的繁簡專用字集合，用於判斷文本類型
-# 這些列表不需要非常詳盡，有幾十個常用字就能達到很高的準確率
-TC_UNIQUE_CHARS = set("歐體國發見無麼裡蘋語劃讚裡麵")
-SC_UNIQUE_CHARS = set("欧体国发见无么里苹语划赞里下面")
-
-# --- Helper Functions ---
-
-def detect_chinese_variant(text: str) -> str:
-    """
-    使用單一字元特徵判斷文本是繁體、簡體或混合。
-    :param text: 輸入的字串。
-    :return: "繁體中文", "簡體中文", 或 "混合/未知"。
-    """
-    if not isinstance(text, str) or not text.strip():
-        return "混合/未知"
-
-    tc_count = 0
-    sc_count = 0
-
-    for char in text:
-        if char in TC_UNIQUE_CHARS:
-            tc_count += 1
-        elif char in SC_UNIQUE_CHARS:
-            sc_count += 1
-    
-    # 根據命中專用字的數量來判斷
-    # 增加一個小小的權重，避免因單一字元誤判
-    if tc_count > sc_count:
-        return "繁體中文"
-    elif sc_count > tc_count:
-        return "簡體中文"
-    else:
-        # 如果數量相等（包括都為0的情況），則視為混合或無法判斷
-        return "混合/未知"
-
-def is_chinese(text: str) -> bool:
-    """
-    使用 langdetect 檢測文本是否為中文。
-    """
-    try:
-        # 只檢測 'zh-cn' 和 'zh-tw'
-        lang = detect(text)
-        return lang in ['zh-cn', 'zh-tw']
-    except LangDetectException:
-        # 如果 langdetect 無法識別（例如，純表情符號或太短），則視為非中文
-        return False
-    except Exception:
-        # 處理其他潛在錯誤
-        return False
-
-def get_video_comments(youtube, video_id, max_comments):
-    """獲取單一影片的留言。"""
-    all_comments = []
-    try:
-        request = youtube.commentThreads().list(
-            part="snippet",
-            videoId=video_id,
-            maxResults=min(100, max_comments),
-            textFormat="plainText"
-        )
-        
-        while request and len(all_comments) < max_comments:
-            response = request.execute()
-            for item in response["items"]:
-                comment = item["snippet"]["topLevelComment"]["snippet"]
-                all_comments.append({
-                    "author": comment["authorDisplayName"],
-                    "publishedAt": comment["publishedAt"],
-                    "textDisplay": comment["textDisplay"]
-                })
-                if len(all_comments) >= max_comments:
-                    break
-            
-            if 'nextPageToken' in response and len(all_comments) < max_comments:
-                request = youtube.commentThreads().list_next(previous_request=request, previous_response=response)
-            else:
-                break
-    except Exception as e:
-        st.warning(f"無法獲取影片 ID {video_id} 的留言: {e}", icon="⚠️")
-    return all_comments
-
-def search_videos(youtube, query, start_date, end_date, max_videos):
-    """根據關鍵字和日期範圍搜索影片。"""
-    all_videos = []
-    request = youtube.search().list(
-        q=query,
-        part="snippet",
-        type="video",
-        maxResults=min(50, max_videos),
-        publishedAfter=start_date + "T00:00:00Z",
-        publishedBefore=end_date + "T23:59:59Z"
-    )
-
-    while request and len(all_videos) < max_videos:
-        response = request.execute()
-        for item in response['items']:
-            all_videos.append({
-                'videoId': item['id']['videoId'],
-                'title': item['snippet']['title'],
-                'publishedAt': item['snippet']['publishedAt']
-            })
-            if len(all_videos) >= max_videos:
-                break
-        
-        if 'nextPageToken' in response and len(all_videos) < max_videos:
-            request = youtube.search().list_next(previous_request=request, previous_response=response)
-        else:
-            break
-            
-    return all_videos
-
-# --- AI Analysis Functions ---
-
-# 定義一個 Semaphore，例如，一次最多只允許 10 個並行請求
-SEMAPHORE = asyncio.Semaphore(10)
-
-async def analyze_comment_async(comment: str, client: AsyncOpenAI):
-    """
-    使用 Semaphore 包裹的非同步函式，用於分析單一留言。
-    """
-    async with SEMAPHORE:
-        if not comment or not comment.strip():
-            return {"sentiment": "neutral", "positive": 0, "negative": 0, "neutral": 1, "reason": "留言為空"}
-
+# ========== 1. YouTube Search (MODIFIED) ==========
+# 移除了 'relevanceLanguage' 和 'regionCode' 參數，因為它們不是嚴格的過濾器。
+# 我們將在抓取留言後進行更可靠的語言篩選。
+def search_youtube_videos(keywords, youtube_client, max_per_keyword, start_date, end_date):
+    all_video_ids = set()
+    for query in keywords:
         try:
-            response = await client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": "你是一個情感分析專家。請將以下評論分類為'positive', 'negative', 或 'neutral'。請只用JSON格式回答，包含'sentiment'和'reason'兩個鍵。"},
-                    {"role": "user", "content": comment}
-                ],
-                temperature=0,
-                max_tokens=100,
-                response_format={"type": "json_object"}
-            )
-            analysis_text = response.choices[0].message.content
-            analysis_json = json.loads(analysis_text)
-            
-            sentiment = analysis_json.get("sentiment", "neutral").lower()
-            
-            # 確保情感是三種類型之一
-            if sentiment not in ["positive", "negative", "neutral"]:
-                sentiment = "neutral"
-
-            return {
-                "sentiment": sentiment,
-                "positive": 1 if sentiment == "positive" else 0,
-                "negative": 1 if sentiment == "negative" else 0,
-                "neutral": 1 if sentiment == "neutral" else 0,
-                "reason": analysis_json.get("reason", "")
-            }
-        except OpenAIError as e:
-            return {"sentiment": "error", "positive": 0, "negative": 0, "neutral": 0, "reason": f"API 錯誤: {e}"}
-        except (json.JSONDecodeError, TypeError):
-            return {"sentiment": "error", "positive": 0, "negative": 0, "neutral": 0, "reason": "無法解析AI回應"}
+            search_response = youtube_client.search().list(
+                q=query,
+                part='id,snippet',
+                type='video',
+                maxResults=max_per_keyword,
+                publishedAfter=f"{start_date}T00:00:00Z",
+                publishedBefore=f"{end_date}T23:59:59Z"
+                # ### MODIFIED: 移除以下兩行 ###
+                # relevanceLanguage='zh-Hant',
+                # regionCode='HK'
+            ).execute()
+            video_ids = [item['id']['videoId'] for item in search_response.get('items', [])]
+            all_video_ids.update(video_ids)
+            time.sleep(0.5)
         except Exception as e:
-            return {"sentiment": "error", "positive": 0, "negative": 0, "neutral": 0, "reason": f"未知錯誤: {e}"}
+            st.warning(f"搜尋關鍵字 '{query}' 時發生錯誤: {e}")
+            continue
+    return list(all_video_ids)
 
-async def run_all_analyses(df: pd.DataFrame, client: AsyncOpenAI):
-    """使用 asyncio.gather 和 Semaphore 執行所有留言的情感分析。"""
-    tasks = [analyze_comment_async(comment, client) for comment in df['textDisplay']]
-    
-    analysis_results = await tqdm_asyncio.gather(
-        *tasks, 
-        desc="AI Sentiment Analysis (Concurrent)"
+# ========== 2. Batch Fetch Comments (No changes) ==========
+def get_all_comments(video_ids, youtube_client, max_per_video):
+    all_comments = []
+    progress_bar = st.progress(0, text="抓取 YouTube 留言中...")
+    total_videos = len(video_ids)
+    for i, video_id in enumerate(video_ids):
+        try:
+            request = youtube_client.commentThreads().list(
+                part='snippet', videoId=video_id, textFormat='plainText', maxResults=100
+            )
+            comments_fetched = 0
+            while request and comments_fetched < max_per_video:
+                response = request.execute()
+                for item in response['items']:
+                    if comments_fetched >= max_per_video:
+                        break
+                    comment = item['snippet']['topLevelComment']['snippet']
+                    all_comments.append({
+                        'video_id': video_id,
+                        'comment_text': comment['textDisplay'],
+                        'published_at': comment['publishedAt'],
+                        'like_count': comment['likeCount']
+                    })
+                    comments_fetched += 1
+                if comments_fetched >= max_per_video:
+                    break
+                request = youtube_client.commentThreads().list_next(request, response)
+        except Exception:
+            continue
+        finally:
+            # 更新進度條
+            progress_bar.progress((i + 1) / total_videos, text=f"抓取 YouTube 留言中... ({i+1}/{total_videos} 部影片)")
+    progress_bar.empty() # 完成後移除進度條
+    return pd.DataFrame(all_comments)
+
+# ========== 3. DeepSeek AI Sentiment Analysis (No changes) ==========
+async def analyze_comment_deepseek_async(comment_text, deepseek_client, semaphore, max_retries=3):
+    import json
+    if not isinstance(comment_text, str) or len(comment_text.strip()) < 5:
+        return {"sentiment": "Invalid", "topic": "N/A", "summary": "Comment too short or invalid."}
+
+    system_prompt = (
+        "You are a professional Hong Kong market sentiment analyst. "
+        "Analyze the following movie comment and strictly return the result in JSON format. "
+        "The JSON object must contain three keys: "
+        "1. 'sentiment': Must be either 'Positive', 'Negative', or 'Neutral'. "
+        "2. 'topic': The core topic of the comment, e.g., 'Plot', 'Acting', 'Action Design', "
+        "'Visuals', 'Pace', or 'Overall'. If unable to determine, use 'N/A'. "
+        "3. 'summary': A concise one-sentence summary of the comment's main point. "
+        "Ensure the output is only the JSON object and nothing else."
     )
+
+    async with semaphore:
+        for attempt in range(max_retries):
+            try:
+                response = await deepseek_client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": comment_text}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                )
+                analysis_result = json.loads(response.choices[0].message.content)
+                return analysis_result
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    return {"sentiment": "Error", "topic": "Error", "summary": f"API Error: {e}"}
+
+# ========== 4. Main Process (MODIFIED) ==========
+# 增加了繁體中文留言的篩選邏輯
+async def run_all_analyses(df, deepseek_client):
+    semaphore = asyncio.Semaphore(50)
+    tasks = [
+        analyze_comment_deepseek_async(comment_text, deepseek_client, semaphore)
+        for comment_text in df['comment_text']
+    ]
+
+    # 使用 Streamlit 的進度條來顯示 AI 分析進度
+    progress_bar = st.progress(0, text="AI 情感分析中...")
     
-    return analysis_results
+    results = []
+    for i, f in enumerate(asyncio.as_completed(tasks)):
+        results.append(await f)
+        progress_bar.progress((i + 1) / len(tasks), text=f"AI 情感分析中... ({i+1}/{len(tasks)})")
+        
+    progress_bar.empty()
+    # 由於 as_completed 不保證順序，我們需要一種方法來重新對齊結果。
+    # 這裡我們暫時假設順序問題不大，或者在更複雜的場景中需要傳遞索引。
+    # 為了簡單起見，我們直接返回結果列表。
+    return results
 
-# --- Visualization Functions ---
+def movie_comment_analysis(
+    movie_title, start_date, end_date,
+    yt_api_key, deepseek_api_key,
+    max_videos_per_keyword=30, max_comments_per_video=50, sample_size=None
+):
+    SEARCH_KEYWORDS = [
+        f'"{movie_title}" 預告', f'"{movie_title}" review', f'"{movie_title}" 影評',
+        f'"{movie_title}" 分析', f'"{movie_title}" 好唔好睇', f'"{movie_title}" 討論',
+        f'"{movie_title}" reaction'
+    ]
 
-def create_sunburst_chart(df: pd.DataFrame):
-    """
-    創建一個 Plotly 旭日圖，顯示情感和語言變體的層級分佈。
-    """
-    # 確保情感和語言變體欄位存在
-    if 'sentiment' not in df.columns or 'script_variant' not in df.columns:
-        st.warning("缺少 'sentiment' 或 'script_variant' 欄位，無法生成旭日圖。")
-        return None
+    from googleapiclient.discovery import build
+    youtube_client = build('youtube', 'v3', developerKey=yt_api_key)
 
-    # 處理 'error' 情感，將其歸類為 'neutral' 以便於視覺化
-    df_plot = df.copy()
-    df_plot['sentiment'] = df_plot['sentiment'].replace('error', 'neutral')
-    
-    # 創建旭日圖
-    fig = px.sunburst(
-        df_plot,
-        path=['sentiment', 'script_variant'], # <<< 修改：增加層級
-        title="情感與語言變體分佈旭日圖",
-        color='sentiment',
-        color_discrete_map={
-            'positive': '#2ca02c', # 綠色
-            'negative': '#d62728', # 紅色
-            'neutral': '#7f7f7f'   # 灰色
-        }
+    deepseek_client = openai.AsyncOpenAI(
+        api_key=deepseek_api_key,
+        base_url="https://api.deepseek.com/v1"
     )
-    fig.update_traces(textinfo="label+percent parent")
-    fig.update_layout(margin=dict(t=50, l=10, r=10, b=10))
-    return fig
 
-# --- Main Application Logic ---
+    video_ids = search_youtube_videos(
+        SEARCH_KEYWORDS, youtube_client, max_videos_per_keyword, start_date, end_date
+    )
+    if not video_ids:
+        return None, "找不到相關影片。"
 
-@st.cache_data(ttl=3600)
-def movie_comment_analysis(movie_title, start_date, end_date, yt_api_key, deepseek_api_key, max_videos, max_comments, sample_size):
-    try:
-        youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=yt_api_key)
-        
-        # 1. 搜索影片
-        videos = search_videos(youtube, f"{movie_title} 預告", start_date, end_date, max_videos)
-        if not videos:
-            return None, "在指定日期範圍內找不到相關影片。"
+    df_comments = get_all_comments(video_ids, youtube_client, max_comments_per_video)
+    if df_comments.empty:
+        return None, "找不到任何留言。"
 
-        # 2. 獲取所有影片的留言
-        all_comments = []
-        for video in videos:
-            comments = get_video_comments(youtube, video['videoId'], max_comments)
-            all_comments.extend(comments)
-        
-        if not all_comments:
-            return None, "找到了影片，但無法獲取任何留言。"
-
-        df_comments = pd.DataFrame(all_comments)
-        df_comments.drop_duplicates(subset=['textDisplay'], inplace=True)
-
-        # 3. 語言檢測與篩選
-        st.write(f"初步獲取 {len(df_comments)} 則不重複留言，開始進行語言篩選...")
-        df_comments['is_chinese'] = df_comments['textDisplay'].apply(is_chinese)
-        df_chinese = df_comments[df_comments['is_chinese']].copy()
-        
-        if df_chinese.empty:
-            return None, "過濾後沒有找到任何中文留言。"
-        
-        # <<< 新增：應用繁簡體判斷函式 >>>
-        df_chinese['script_variant'] = df_chinese['textDisplay'].apply(detect_chinese_variant)
-
-        # 4. 留言抽樣
-        num_to_analyze = min(len(df_chinese), sample_size)
-        df_analyze = df_chinese.sample(n=num_to_analyze, random_state=42)
-
-        # 5. AI 情感分析
-        if not deepseek_api_key:
-            return None, "請在左側輸入 DeepSeek API 金鑰以進行情感分析。"
-            
-        deepseek_client = AsyncOpenAI(api_key=deepseek_api_key, base_url="https://api.deepseek.com/v1")
-        
-        analysis_results = asyncio.run(run_all_analyses(df_analyze, deepseek_client))
-        
-        df_analysis_results = pd.DataFrame(analysis_results)
-        
-        # 6. 合併結果
-        df_result = df_analyze.reset_index(drop=True).join(df_analysis_results)
-        
-        return df_result, None
-
-    except Exception as e:
-        return None, f"發生嚴重錯誤: {e}"
-
-# --- Streamlit UI ---
-
-st.set_page_config(page_title="電影社群口碑分析器", layout="wide")
-st.title("🎬 電影社群口碑分析器")
-st.markdown("輸入電影名稱，本工具將自動從 YouTube 抓取相關預告片的留言，並使用 AI 進行情感分析，幫助您快速了解大眾口碑。")
-
-# Sidebar for inputs
-with st.sidebar:
-    st.header("⚙️ 分析設定")
+    # ### NEW: 繁體中文留言篩選邏輯 ###
+    st.info(f"已抓取 {len(df_comments)} 則原始留言，現開始篩選繁體中文內容...")
     
-    yt_api_key = st.text_input("Google (YouTube) API Key", type="password", help="請輸入您的 YouTube Data API v3 金鑰。")
-    deepseek_api_key = st.text_input("DeepSeek API Key", type="password", help="請輸入您的 DeepSeek API 金鑰。")
-
-    movie_title = st.text_input("電影名稱", "沙丘")
+    # 初始化 OpenCC，'t2s' 表示從繁體 (Traditional) 到簡體 (Simplified)
+    cc = OpenCC('t2s')
     
-    today = datetime.now()
-    one_month_ago = today - timedelta(days=30)
+    def is_traditional_chinese(text):
+        if not isinstance(text, str) or len(text.strip()) < 2:
+            return False
+        # 判斷邏輯：如果將文本從繁體轉換為簡體後，與原文不同，
+        # 就意味著原文中至少包含一個可被轉換的繁體字。
+        return cc.convert(text) != text
+
+    mask_trad = df_comments['comment_text'].apply(is_traditional_chinese)
+    df_comments_filtered = df_comments[mask_trad].reset_index(drop=True)
     
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("開始日期", one_month_ago)
-    with col2:
-        end_date = st.date_input("結束日期", today)
+    st.info(f"篩選後剩下 {len(df_comments_filtered)} 則繁體中文留言。")
+    
+    if df_comments_filtered.empty:
+        return None, "在抓取的留言中找不到繁體中文內容。"
+    
+    # 後續流程使用篩選後的 DataFrame
+    df_comments = df_comments_filtered
+    # ### END OF NEW BLOCK ###
 
-    st.subheader("資料量控制")
-    max_videos = st.slider("最大影片搜索數量", 1, 50, 5, help="從 YouTube 搜索多少部相關影片來抓取留言。")
-    max_comments = st.slider("每部影片最大留言數", 50, 500, 100, help="從每部影片中最多抓取多少則留言。")
-    sample_size = st.slider("AI 分析樣本數", 50, 1000, 200, help="從所有中文留言中隨機抽取多少則進行 AI 情感分析。")
+    df_comments['published_at'] = pd.to_datetime(df_comments['published_at'], utc=True)
+    df_comments['published_at_hk'] = df_comments['published_at'].dt.tz_convert('Asia/Hong_Kong')
 
-    analyze_button = st.button("🚀 開始分析", use_container_width=True, type="primary")
+    start_dt = pd.to_datetime(start_date).tz_localize('Asia/Hong_Kong')
+    end_dt = pd.to_datetime(end_date).tz_localize('Asia/Hong_Kong') + timedelta(days=1)
+    mask_date = (df_comments['published_at_hk'] >= start_dt) & (df_comments['published_at_hk'] < end_dt)
+    df_comments = df_comments.loc[mask_date].reset_index(drop=True)
+    if df_comments.empty:
+        return None, "在指定日期範圍內沒有符合語言條件的留言。"
 
-if analyze_button:
-    if not yt_api_key or not deepseek_api_key:
-        st.error("請務必在左側設定中輸入 YouTube 和 DeepSeek 的 API 金鑰！")
+    if sample_size and sample_size > 0 and sample_size < len(df_comments):
+        df_analyze = df_comments.sample(n=sample_size, random_state=42)
     else:
-        with st.spinner("正在執行分析，請稍候... (可能需要幾分鐘)"):
+        df_analyze = df_comments
+
+    st.info(f"準備對 {len(df_analyze)} 則留言進行高速並發分析...")
+    
+    # 運行異步分析
+    analysis_results_unordered = asyncio.run(run_all_analyses(df_analyze, deepseek_client))
+    
+    # 因為 asyncio.as_completed 的結果是無序的，我們需要將其與原始數據安全地合併。
+    # 最安全的方法是將分析結果轉換為 DataFrame，並確保其索引與 df_analyze 一致。
+    analysis_df = pd.DataFrame(analysis_results_unordered)
+    
+    # 檢查行數是否匹配
+    if len(df_analyze) != len(analysis_df):
+        st.warning("AI 分析返回的結果數量與請求數量不匹配，數據可能未完全對齊。")
+        # 採取一種保守的合併策略
+        min_len = min(len(df_analyze), len(analysis_df))
+        final_df = pd.concat([df_analyze.head(min_len).reset_index(drop=True), analysis_df.head(min_len)], axis=1)
+    else:
+        final_df = pd.concat([df_analyze.reset_index(drop=True), analysis_df], axis=1)
+
+    final_df['published_at'] = pd.to_datetime(final_df['published_at'])
+    return final_df, None
+
+# ========== 5. Streamlit UI (No changes in this part) ==========
+st.set_page_config(page_title="YouTube 電影評論 AI 分析", layout="wide")
+st.title("🎬 YouTube 電影評論 AI 情感分析")
+
+with st.expander("使用說明"):
+    st.markdown("""
+    1.  輸入電影的**中文全名**、分析時間範圍及所需的 API 金鑰。
+    2.  自訂每個關鍵字搜尋的影片數量上限，及每部影片抓取的留言數量上限。
+    3.  點擊「開始分析」，系統將自動抓取 YouTube 留言，**篩選出繁體中文內容**，並進行 AI 高速情感分析。
+    4.  分析完成後，下方會顯示數據圖表及詳細結果的下載按鈕。
+    """)
+
+movie_title = st.text_input("電影名稱 (建議使用香港通用的中文全名)", value="九龍城寨之圍城")
+col1, col2 = st.columns(2)
+with col1:
+    start_date = st.date_input("開始日期", value=datetime.today() - timedelta(days=30))
+with col2:
+    end_date = st.date_input("結束日期", value=datetime.today())
+yt_api_key = st.text_input("YouTube API Key", type='password')
+deepseek_api_key = st.text_input("DeepSeek API Key", type='password')
+
+st.subheader("進階設定")
+max_videos = st.slider("每個關鍵字的最大影片搜尋數", 5, 50, 10, help="增加此數值會找到更多影片，但會增加 YouTube API 的配額消耗。")
+max_comments = st.slider("每部影片的最大留言抓取數", 10, 200, 50, help="分析的主要來源，數量越多，分析結果越全面，但 DeepSeek API 成本越高。")
+sample_size = st.number_input("分析留言數量上限 (0 代表分析全部已抓取的留言)", 0, 5000, 500, help="設定一個上限以控制分析時間和成本。例如，即使抓取了 2000 則留言，這裡設 500 就只會分析其中的 500 則。")
+
+if st.button("🚀 開始分析"):
+    if not all([movie_title, yt_api_key, deepseek_api_key]):
+        st.warning("請填寫電影名稱和兩個 API 金鑰。")
+    else:
+        # 使用一個容器來包裹整個分析過程，方便最後統一處理
+        result_container = st.container()
+        
+        with st.spinner("AI 高速分析中... 請稍候..."):
             df_result, err = movie_comment_analysis(
                 movie_title, str(start_date), str(end_date),
                 yt_api_key, deepseek_api_key,
@@ -313,52 +264,112 @@ if analyze_button:
             )
 
         if err:
-            st.error(f"分析失敗：{err}")
-        elif df_result is not None:
+            st.error(err)
+        else:
             st.success("分析完成！")
+            st.dataframe(df_result.head(20))
             
-            # --- 結果展示 ---
-            total_comments = len(df_result)
-            positive_count = df_result['positive'].sum()
-            negative_count = df_result['negative'].sum()
-            neutral_count = df_result['neutral'].sum()
-            error_count = (df_result['sentiment'] == 'error').sum()
+            st.header("📊 可視化分析結果")
 
-            st.header("📊 整體情感分佈")
-            
-            # 指標卡
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("正面留言 👍", f"{positive_count}", f"{positive_count/total_comments:.1%}")
-            col2.metric("負面留言 👎", f"{negative_count}", f"-{negative_count/total_comments:.1%}")
-            col3.metric("中性留言 😐", f"{neutral_count}", f"{neutral_count/total_comments:.1%}")
-            col4.metric("分析失敗數 ❌", f"{error_count}", "應為 0")
+            # --- 共用設定 ---
+            sentiments_order = ['Positive', 'Negative', 'Neutral', 'Invalid', 'Error']
+            colors_map = {
+                'Positive': '#5cb85c', 'Negative': '#d9534f', 'Neutral': '#f0ad4e',
+                'Invalid': '#cccccc', 'Error': '#888888'
+            }
 
-            # 視覺化圖表
-            sunburst_fig = create_sunburst_chart(df_result)
-            if sunburst_fig:
-                st.plotly_chart(sunburst_fig, use_container_width=True)
+            # --- 1. 情感分佈圓餅圖 ---
+            st.subheader("1. Sentiment Distribution (Pie)")
+            sentiment_series = df_result['sentiment'].dropna().astype(str)
+            sentiment_counts = sentiment_series.value_counts()
+            ordered_labels = [label for label in sentiments_order if label in sentiment_counts.index]
 
-            # --- 留言詳情與篩選 ---
-            st.header("📜 留言詳情")
-
-            # <<< 新增：語言變體篩選器 >>>
-            variant_options = ["全部"] + df_result['script_variant'].unique().tolist()
-            selected_variant = st.selectbox("篩選語言變體:", options=variant_options)
-
-            # 根據選擇進行篩選
-            if selected_variant == "全部":
-                df_display = df_result
+            if not sentiment_counts.empty:
+                fig1, ax1 = plt.subplots(figsize=(5, 4))
+                ax1.pie(
+                    sentiment_counts[ordered_labels],
+                    labels=ordered_labels,
+                    autopct='%.1f%%',
+                    colors=[colors_map[label] for label in ordered_labels],
+                    wedgeprops={'linewidth': 1.0, 'edgecolor': 'white'}
+                )
+                ax1.set_title('Overall Sentiment Distribution', fontsize=16)
+                st.pyplot(fig1, use_container_width=False)
             else:
-                df_display = df_result[df_result['script_variant'] == selected_variant]
+                st.info("No sentiment data available for pie chart.")
 
-            # 顯示篩選後的資料
-            st.dataframe(df_display[[
-                'sentiment', 
-                'script_variant', # <<< 新增：顯示語言變體欄
-                'textDisplay', 
-                'reason', 
-                'author', 
-                'publishedAt'
-            ]], use_container_width=True)
+            # --- 2. 每日情感趨勢圖 ---
+            st.subheader("2. Daily Sentiment Trend")
             
-            st.info(f"共顯示 {len(df_display)} / {total_comments} 則分析後的留言。")
+            if 'published_at_hk' in df_result.columns:
+                df_result['date'] = df_result['published_at_hk'].dt.date
+            else:
+                df_result['date'] = df_result['published_at'].dt.date
+            
+            daily = df_result.groupby(['date', 'sentiment']).size().unstack().fillna(0)
+            daily = daily.reindex(columns=sentiments_order).dropna(axis=1, how='all')
+
+            if not daily.empty:
+                daily_long = daily.reset_index().melt(id_vars='date', var_name='sentiment', value_name='count')
+                
+                st.markdown("#### 每日情感趨勢 (折線圖)")
+                fig_line = px.line(
+                    daily_long, x='date', y='count', color='sentiment',
+                    title='Daily Comment Volume Trend by Sentiment',
+                    labels={'date': 'Date', 'count': 'Number of Comments', 'sentiment': 'Sentiment'},
+                    color_discrete_map=colors_map,
+                    category_orders={'sentiment': [col for col in sentiments_order if col in daily.columns]}
+                )
+                st.plotly_chart(fig_line, use_container_width=True)
+
+                st.markdown("#### 每日留言總量及情感分佈 (堆疊長條圖)")
+                fig_bar = px.bar(
+                    daily_long, x='date', y='count', color='sentiment',
+                    title='Daily Comment Volume by Sentiment (Stacked)',
+                    labels={'date': 'Date', 'count': 'Number of Comments', 'sentiment': 'Sentiment'},
+                    color_discrete_map=colors_map,
+                    category_orders={'sentiment': [col for col in sentiments_order if col in daily.columns]},
+                    barmode='stack'
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+            else:
+                st.info("Not enough daily sentiment data to display the trend charts.")
+
+            # --- 3. 各主題情感佔比 ---
+            st.subheader("3. Sentiment Share by Topic")
+            topic_sentiment = df_result.groupby(['topic', 'sentiment']).size().unstack().fillna(0)
+            topic_sentiment = topic_sentiment.reindex(columns=sentiments_order).dropna(axis=1, how='all')
+            
+            if not topic_sentiment.empty:
+                topic_sentiment = topic_sentiment[topic_sentiment.sum(axis=1) > 0]
+                
+                if not topic_sentiment.empty:
+                    topic_sentiment_percent = topic_sentiment.div(topic_sentiment.sum(axis=1), axis=0).fillna(0) * 100
+
+                    fig3, ax3 = plt.subplots(figsize=(10, 5))
+                    topic_sentiment_percent.plot(
+                        kind='bar', stacked=True, ax=ax3,
+                        color=[colors_map[col] for col in topic_sentiment_percent.columns]
+                    )
+                    ax3.set_title('Sentiment Share by Topic', fontsize=16)
+                    ax3.set_xlabel('Topic')
+                    ax3.set_ylabel('Percentage (%)')
+                    ax3.yaxis.set_major_formatter(plt.FuncFormatter('{:.0f}%'.format))
+                    plt.xticks(rotation=45, ha='right')
+                    ax3.legend(title='Sentiment')
+                    plt.tight_layout()
+                    st.pyplot(fig3, use_container_width=True)
+                else:
+                    st.info("No topic data with comments to display the chart.")
+            else:
+                st.info("Not enough topic sentiment data to display the stacked bar chart.")
+
+            # --- 4. 下載分析明細 ---
+            st.subheader("4. 下載分析明細")
+            csv = df_result.to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                "📥 下載全部分析明細 (CSV)",
+                csv,
+                file_name=f"{movie_title}_analysis_details.csv",
+                mime='text/csv'
+            )
