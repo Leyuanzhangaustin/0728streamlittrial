@@ -1,5 +1,5 @@
 # app.py (Final Visualization Version - Revised for Language Filtering)
-
+pip install opencc-python-reimplemented
 import streamlit as st
 import pandas as pd
 import numpy as np
