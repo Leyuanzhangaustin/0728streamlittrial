@@ -577,7 +577,7 @@ prefer_hk_videos = st.checkbox("優先抓取更可能來自香港/粵語的影�
 
 cantonese_threshold = st.slider("粵語分數門檻", 0.5, 6.0, 2.0, 0.5, help="分數越高越嚴格，2.0 是較穩健的門檻。")
 auto_relax_threshold = st.checkbox("自動放寬門檻以達到目標樣本量", value=True)
-target_min_cantonese = st.number_input("目標最少粵語評論數（啟用自動放寬時生效）", 50, 2000, 300)
+target_min_cantonese = st.number_input("目標最少粵語評論數（啟用自動放寬時生效）", 50, 5000, 300)
 
 if st.button("🚀 開始分析"):
     if not all([movie_title, yt_api_key, deepseek_api_key]):
