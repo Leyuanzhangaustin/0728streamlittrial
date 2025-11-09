@@ -14,31 +14,29 @@ from opencc import OpenCC
 from googleapiclient.discovery import build
 
 # =========================
-# 0. 工具函數：關鍵字、語言檢測
+# 0. 工具與規則：關鍵字、語言與粵語檢測
 # =========================
 
 def generate_search_queries(movie_title: str):
     """
-    生成更寬鬆且多樣化的關鍵字組合：
-    - 去掉過於嚴格的引號限制
-    - 中英混合，涵蓋「影評/評論/評價/解析/分析/無雷/有雷/預告/花絮/反應/review/reaction/ending explained」
-    - 仍保留少量帶引號的精確匹配，作為補充
+    生成偏向香港/粵語的寬鬆關鍵字組合 + 少量精確短語。
     """
     zh_terms = [
         "影評", "評論", "評價", "點評", "解析", "分析", "觀後感",
-        "無雷", "有雷", "討論", "好唔好睇", "預告", "花絮", "片段", "首映", "幕後"
+        "無雷", "有雷", "討論", "好唔好睇", "預告", "花絮", "片段", "首映", "幕後",
+        "香港", "香港上映", "香港首映", "香港反應", "戲院 反應", "院線", "街訪",
+        "粵語", "廣東話", "粵語配音", "粵配", "港版", "港產"
     ]
     en_terms = [
         "review", "reaction", "ending explained", "analysis", "explained",
-        "behind the scenes", "bts", "premiere", "interview", "press conference"
+        "behind the scenes", "bts", "premiere", "interview", "press conference",
+        "hong kong", "hk reaction", "hk audience"
     ]
 
-    # 寬鬆（無引號）
     loose = [f"{movie_title}"]
     loose += [f"{movie_title} {t}" for t in zh_terms]
     loose += [f"{movie_title} {t}" for t in en_terms]
 
-    # 少量精確（帶引號）
     tight = [
         f"\"{movie_title}\"",
         f"\"{movie_title}\" 影評",
@@ -46,9 +44,11 @@ def generate_search_queries(movie_title: str):
         f"\"{movie_title}\" 解析",
         f"\"{movie_title}\" review",
         f"\"{movie_title}\" reaction",
+        f"\"{movie_title}\" 香港",
+        f"\"{movie_title}\" 粵語",
+        f"\"{movie_title}\" 廣東話",
     ]
 
-    # 去重保序
     seen = set()
     queries = []
     for q in loose + tight:
@@ -58,19 +58,27 @@ def generate_search_queries(movie_title: str):
     return queries
 
 
+# 粵語標記詞（本字/口語/助詞）與權重
+CANTONESE_CHAR_TOKENS = {
+    "唔": 1.0, "冇": 1.6, "咗": 1.6, "嘅": 1.6, "啲": 1.2, "嗰": 1.2, "佢": 1.0,
+    "喺": 1.6, "嚟": 1.6, "咪": 1.2, "啱": 1.2, "掂": 1.2, "靚": 1.2, "曳": 1.2,
+    "攰": 1.2, "咁": 1.0, "噉": 1.0, "得": 0.6, "吖": 0.8, "冧": 1.0, "撚": 1.2,
+    "仆": 1.2, "屌": 1.2, "嗮": 1.0, "畀": 0.8, "揸": 1.0, "腎": 0.0  # 佔位避免誤觸
+}
+CANTONESE_PARTICLES = ["啦", "囉", "喎", "咩", "呢", "呀", "嘛", "喇"]
+CANTONESE_PHRASES = {
+    "好唔好睇": 2.0, "做咩": 1.6, "點解": 1.2, "咩料": 1.6, "算啦": 1.2,
+    "得啦": 1.2, "正喎": 1.2, "幾好睇": 1.6, "幾正": 1.2, "好正": 1.0,
+    "有啲": 0.8, "嗰啲": 1.2, "呢啲": 1.2, "講真": 0.8, "好似": 0.5
+}
+# 常見粵拼後綴（句尾/詞尾）
+ROMANIZATION_RE = re.compile(r"(?i)(?<![A-Za-z])(la|lor|wor|leh|meh|mah|ga|wo|ar)(?=[\s\W]|$)")
+
+# 假名/字符統計
 def count_chars(text: str):
-    """
-    計算各類字符數量：中日韓漢字、假名、拉丁、數字等
-    """
     counts = {
-        "cjk": 0,
-        "hiragana": 0,
-        "katakana": 0,
-        "half_katakana": 0,
-        "hangul": 0,
-        "latin": 0,
-        "digits": 0,
-        "other": 0
+        "cjk": 0, "hiragana": 0, "katakana": 0, "half_katakana": 0,
+        "hangul": 0, "latin": 0, "digits": 0, "other": 0
     }
     for ch in text:
         code = ord(ch)
@@ -92,46 +100,32 @@ def count_chars(text: str):
             counts["other"] += 1
     return counts
 
-
 def diff_chars(a: str, b: str) -> int:
-    """
-    估算字符級差異數：zip 對齊後不等 + 長度差
-    """
     m = min(len(a), len(b))
-    base = sum(1 for i in range(m) if a[i] != b[i])
-    return base + abs(len(a) - len(b))
-
+    return sum(1 for i in range(m) if a[i] != b[i]) + abs(len(a) - len(b))
 
 def classify_zh_trad_simp(text: str, cc_t2s: OpenCC, cc_s2t: OpenCC):
     """
-    簡單的語言/書寫系統分類：
-    - ja：含有較高比例的假名（平/片/半角片假名）
-    - zh-Hant：t2s 變化顯著而 s2t 變化很小（原文更接近繁體）
-    - zh-Hans：相反（原文更接近簡體）
-    - zh-unkn：中文但難以區分（多為公共漢字+標點）
-    - other：基本沒有 CJK
+    - ja：假名佔比高 => 日文
+    - zh-Hant：更接近繁體
+    - zh-Hans：更接近簡體
+    - zh-unkn：中文但難分
+    - other：非中日韓
     """
     if not isinstance(text, str) or len(text.strip()) < 2:
         return "other"
-
     counts = count_chars(text)
     kana = counts["hiragana"] + counts["katakana"] + counts["half_katakana"]
     cjk = counts["cjk"]
-
-    # 日文剔除：假名數 >= 2 且相對占比 > 10% 視為日文
     if kana >= 2 and kana / max(1, (cjk + kana)) >= 0.10:
         return "ja"
-
     if cjk < 1:
         return "other"
-
-    t2s = cc_t2s.convert(text)  # 繁->簡
-    s2t = cc_s2t.convert(text)  # 簡->繁
+    t2s = cc_t2s.convert(text)
+    s2t = cc_s2t.convert(text)
     ct2s = diff_chars(text, t2s)
     cs2t = diff_chars(text, s2t)
-
-    threshold = max(1, int(0.05 * cjk))  # cjk 的 5% 作為差異閾值
-
+    threshold = max(1, int(0.05 * cjk))
     if ct2s > cs2t + threshold:
         return "zh-Hant"
     elif cs2t > ct2s + threshold:
@@ -139,9 +133,37 @@ def classify_zh_trad_simp(text: str, cc_t2s: OpenCC, cc_s2t: OpenCC):
     else:
         return "zh-unkn"
 
+def score_cantonese(text: str) -> float:
+    if not isinstance(text, str) or not text:
+        return 0.0
+    score = 0.0
+    # 詞組優先（避免被字級重複加權）
+    for phrase, w in CANTONESE_PHRASES.items():
+        cnt = text.count(phrase)
+        if cnt:
+            score += cnt * w
+    # 字級（高頻本字/用字）
+    for ch, w in CANTONESE_CHAR_TOKENS.items():
+        cnt = text.count(ch)
+        if cnt:
+            score += cnt * w
+    # 語氣助詞（若出現在句末區域可稍微加分）
+    end_slice = text[-8:] if len(text) > 8 else text
+    for p in CANTONESE_PARTICLES:
+        cnt = text.count(p)
+        if cnt:
+            score += cnt * 0.6
+        if p in end_slice:
+            score += 0.4
+    # 粵拼尾詞（la/lor/wor/leh/meh/mah...）
+    roman_hits = ROMANIZATION_RE.findall(text)
+    if roman_hits:
+        score += len(roman_hits) * 0.8
+    return score
+
 
 # =========================
-# 1. YouTube 搜尋（強化 + 分頁）
+# 1. YouTube 搜尋（偏向香港 + 分頁 + 元數據）
 # =========================
 
 def search_youtube_videos(
@@ -150,15 +172,9 @@ def search_youtube_videos(
     max_per_keyword,
     start_date,
     end_date,
-    add_language_bias=True
+    add_language_bias=True,
+    region_bias=True
 ):
-    """
-    - 對每個關鍵字用 order=relevance 與 order=viewCount 兩種排序抓取
-    - 分頁直到達到 max_per_keyword 或無更多結果
-    - 返回：
-      - video_ids: 去重後的所有視頻 ID 列表
-      - video_meta: {video_id: {"title": ..., "channelTitle": ..., "publishedAt": ...}}
-    """
     all_video_ids = set()
     video_meta = {}
 
@@ -170,12 +186,13 @@ def search_youtube_videos(
                     q=query,
                     part="id,snippet",
                     type="video",
-                    maxResults=50,  # API 上限
+                    maxResults=50,
                     publishedAfter=f"{start_date}T00:00:00Z",
                     publishedBefore=f"{end_date}T23:59:59Z",
                     order=order,
                     safeSearch="none",
-                    **({"relevanceLanguage": "zh-Hant"} if add_language_bias else {})
+                    **({"relevanceLanguage": "zh-Hant"} if add_language_bias else {}),
+                    **({"regionCode": "HK"} if region_bias else {})
                 )
                 while request and len(collected_for_query) < max_per_keyword:
                     response = request.execute()
@@ -185,7 +202,6 @@ def search_youtube_videos(
                             continue
                         collected_for_query.add(vid)
                         all_video_ids.add(vid)
-                        # 保留一份基本元數據（標題/頻道/時間）
                         if vid not in video_meta:
                             snip = item.get("snippet", {})
                             video_meta[vid] = {
@@ -193,27 +209,110 @@ def search_youtube_videos(
                                 "channelTitle": snip.get("channelTitle", ""),
                                 "publishedAt": snip.get("publishedAt", "")
                             }
-                    # 翻頁
                     request = youtube_client.search().list_next(request, response)
                     if len(collected_for_query) >= max_per_keyword:
                         break
-                    time.sleep(0.2)  # 溫和限流
+                    time.sleep(0.15)
             except Exception as e:
                 st.warning(f"搜尋關鍵字 '{query}'（order={order}）時發生錯誤: {e}")
                 continue
     return list(all_video_ids), video_meta
 
 
+def fetch_video_and_channel_details(video_ids, youtube_client):
+    """
+    取回每個視頻的 snippet 以獲得 channelId/defaultAudioLanguage/tags，
+    再取回頻道 brandingSettings.channel.country 用於香港傾向判斷。
+    """
+    video_extra = {}
+    channel_ids = set()
+
+    # videos.list（分批）
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i:i+50]
+        try:
+            resp = youtube_client.videos().list(
+                part="snippet,contentDetails",
+                id=",".join(chunk)
+            ).execute()
+            for item in resp.get("items", []):
+                vid = item.get("id")
+                snip = item.get("snippet", {}) or {}
+                ch = snip.get("channelId")
+                video_extra[vid] = {
+                    "channelId": ch,
+                    "defaultLanguage": (snip.get("defaultLanguage") or ""),
+                    "defaultAudioLanguage": (snip.get("defaultAudioLanguage") or ""),
+                    "tags": snip.get("tags", [])
+                }
+                if ch:
+                    channel_ids.add(ch)
+        except Exception as e:
+            st.warning(f"videos.list 取資料時發生錯誤: {e}")
+
+    channel_country = {}
+    # channels.list（分批）
+    ids = list(channel_ids)
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i+50]
+        try:
+            resp = youtube_client.channels().list(
+                part="brandingSettings",
+                id=",".join(chunk)
+            ).execute()
+            for item in resp.get("items", []):
+                cid = item.get("id")
+                brand = (item.get("brandingSettings", {}) or {}).get("channel", {}) or {}
+                country = brand.get("country")  # 例：'HK'、'TW'、None
+                channel_country[cid] = country
+        except Exception as e:
+            st.warning(f"channels.list 取資料時發生錯誤: {e}")
+
+    return video_extra, channel_country
+
+
+def compute_hk_video_score(
+    video_id, video_meta, video_extra, channel_country_map
+):
+    meta = video_meta.get(video_id, {}) or {}
+    ext = video_extra.get(video_id, {}) or {}
+    title = meta.get("title", "") or ""
+    tags = " ".join(ext.get("tags", []) or [])
+    ch = ext.get("channelId")
+    default_audio = (ext.get("defaultAudioLanguage") or "").lower()
+    country = channel_country_map.get(ch)
+
+    score = 0
+    # 頻道國家 = HK
+    if country == "HK":
+        score += 3
+    # 聲軌/字幕語言偏向香港/粵語
+    if default_audio in ("yue", "zh-hk", "zh-yue", "zh-hant-hk"):
+        score += 3
+    elif default_audio.startswith("zh"):
+        score += 1
+    # 標題/標籤含香港/粵語關鍵字
+    if any(tok in title for tok in ["粵語", "廣東話", "粵配", "粵語配音"]):
+        score += 3
+    if any(tok in title for tok in ["香港", "港版", "香港觀眾", "香港反應", "香港首映", "香港上映"]):
+        score += 2
+    if ("HK" in title) or ("Hong Kong" in title):
+        score += 1
+    if any(tok in tags for tok in ["粵語", "廣東話", "香港", "HK"]):
+        score += 2
+    return score
+
+
 # =========================
-# 2. 批量抓取留言（補充來源信息）
+# 2. 批量抓取留言（補充來源信息 + HK 分數）
 # =========================
 
-def get_all_comments(video_ids, youtube_client, max_per_video, video_meta=None):
-    """
-    抓取每個視頻的頂層評論（commentThreads），直到達到每視頻上限。
-    為每條評論添加來源視頻的標題與超鏈接。
-    """
+def get_all_comments(video_ids, youtube_client, max_per_video, video_meta=None, hk_score_map=None, video_extra=None, channel_country_map=None):
     video_meta = video_meta or {}
+    hk_score_map = hk_score_map or {}
+    video_extra = video_extra or {}
+    channel_country_map = channel_country_map or {}
+
     all_comments = []
     total_videos = len(video_ids)
     progress_bar = st.progress(0, text="抓取 YouTube 留言中...")
@@ -234,10 +333,15 @@ def get_all_comments(video_ids, youtube_client, max_per_video, video_meta=None):
                     if comments_fetched >= max_per_video:
                         break
                     comment = item["snippet"]["topLevelComment"]["snippet"]
+                    ch_id = (video_extra.get(video_id, {}) or {}).get("channelId")
                     all_comments.append({
                         "video_id": video_id,
                         "video_title": video_meta.get(video_id, {}).get("title", ""),
                         "video_url": f"https://www.youtube.com/watch?v={video_id}",
+                        "video_hk_score": hk_score_map.get(video_id, 0),
+                        "video_channel_id": ch_id,
+                        "video_channel_country": (channel_country_map.get(ch_id) if ch_id else None),
+                        "video_default_audio_lang": (video_extra.get(video_id, {}) or {}).get("defaultAudioLanguage", ""),
                         "comment_text": comment.get("textDisplay", ""),
                         "published_at": comment.get("publishedAt", ""),
                         "like_count": comment.get("likeCount", 0)
@@ -246,9 +350,8 @@ def get_all_comments(video_ids, youtube_client, max_per_video, video_meta=None):
                 if comments_fetched >= max_per_video:
                     break
                 request = youtube_client.commentThreads().list_next(request, response)
-                time.sleep(0.2)
+                time.sleep(0.15)
         except Exception:
-            # 有些視頻可能關閉了評論或被限權
             pass
         finally:
             progress_bar.progress(
@@ -300,11 +403,7 @@ async def analyze_comment_deepseek_async(comment_text, deepseek_client, semaphor
                 else:
                     return {"sentiment": "Error", "topic": "Error", "summary": f"API Error: {e}"}
 
-
 async def run_all_analyses(df, deepseek_client):
-    """
-    as_completed + 進度條，但用索引回填，確保輸出與輸入順序一一對齊
-    """
     semaphore = asyncio.Semaphore(50)
     tasks = []
 
@@ -326,16 +425,20 @@ async def run_all_analyses(df, deepseek_client):
 
 
 # =========================
-# 4. 主流程（增強：語言過濾、來源字段、搜尋加寬）
+# 4. 主流程（香港偏向 + 粵語過濾）
 # =========================
 
 def movie_comment_analysis(
     movie_title, start_date, end_date,
     yt_api_key, deepseek_api_key,
     max_videos_per_keyword=30, max_comments_per_video=50, sample_size=None,
-    relax_trad_filter=True
+    relax_trad_filter=True,
+    cantonese_threshold=2.0,
+    auto_relax_threshold=True,
+    target_min_cantonese=300,
+    prefer_hk_videos=True
 ):
-    # 關鍵字生成：寬鬆+精確混合
+    # 生成關鍵字（偏向香港/粵語）
     SEARCH_KEYWORDS = generate_search_queries(movie_title)
 
     youtube_client = build("youtube", "v3", developerKey=yt_api_key)
@@ -344,20 +447,31 @@ def movie_comment_analysis(
         base_url="https://api.deepseek.com/v1"
     )
 
-    # 搜尋（分頁 + 元數據）
+    # 1) 搜尋 + 影片/頻道補充資料
     video_ids, video_meta = search_youtube_videos(
-        SEARCH_KEYWORDS, youtube_client, max_videos_per_keyword, start_date, end_date, add_language_bias=True
+        SEARCH_KEYWORDS, youtube_client, max_videos_per_keyword, start_date, end_date,
+        add_language_bias=True, region_bias=True
     )
     if not video_ids:
         return None, "找不到相關影片。"
 
-    # 留言抓取（補視頻標題與鏈接）
-    df_comments = get_all_comments(video_ids, youtube_client, max_comments_per_video, video_meta=video_meta)
+    video_extra, channel_country_map = fetch_video_and_channel_details(video_ids, youtube_client)
+
+    # 2) 影片香港傾向排序
+    hk_score_map = {vid: compute_hk_video_score(vid, video_meta, video_extra, channel_country_map) for vid in video_ids}
+    video_ids_sorted = sorted(video_ids, key=lambda v: hk_score_map.get(v, 0), reverse=True) if prefer_hk_videos else video_ids
+
+    # 3) 抓取留言（帶來源字段 + hk 分數）
+    df_comments = get_all_comments(
+        video_ids_sorted, youtube_client, max_comments_per_video,
+        video_meta=video_meta, hk_score_map=hk_score_map,
+        video_extra=video_extra, channel_country_map=channel_country_map
+    )
     if df_comments.empty:
         return None, "找不到任何留言。"
 
-    # 語言過濾：顯式剔除日文，保留繁體（可選保留「疑似中文」）
-    st.info(f"已抓取 {len(df_comments)} 則原始留言，現開始語言篩選（繁體 + 剔除日文）...")
+    # 4) 語言過濾（剔除日文，保留繁體/難分）+ 粵語打分
+    st.info(f"已抓取 {len(df_comments)} 則原始留言，現開始語言與粵語篩選...")
 
     cc_t2s = OpenCC("t2s")  # 繁->簡
     cc_s2t = OpenCC("s2t")  # 簡->繁
@@ -366,47 +480,66 @@ def movie_comment_analysis(
         return classify_zh_trad_simp(text, cc_t2s, cc_s2t)
 
     df_comments["lang_pred"] = df_comments["comment_text"].apply(lang_pred)
+    # 剔除日文與非中文
+    df_comments = df_comments[~df_comments["lang_pred"].isin(["ja", "other", "zh-Hans"])].reset_index(drop=True)
 
+    # 若選擇嚴格繁體，則只保留 zh-Hant；否則 zh-Hant + zh-unkn
     if relax_trad_filter:
-        # 放寬：保留 zh-Hant + zh-unkn（疑似中文但難判繁/簡），剔除 ja/other/zh-Hans
-        df_comments_filtered = df_comments[df_comments["lang_pred"].isin(["zh-Hant", "zh-unkn"])].reset_index(drop=True)
+        df_comments = df_comments[df_comments["lang_pred"].isin(["zh-Hant", "zh-unkn"])].reset_index(drop=True)
     else:
-        # 嚴格：只保留 zh-Hant
-        df_comments_filtered = df_comments[df_comments["lang_pred"] == "zh-Hant"].reset_index(drop=True)
+        df_comments = df_comments[df_comments["lang_pred"] == "zh-Hant"].reset_index(drop=True)
 
-    # 顯式剔除日文
-    df_comments_filtered = df_comments_filtered[df_comments_filtered["lang_pred"] != "ja"]
+    if df_comments.empty:
+        return None, "在抓取的留言中沒有符合基本語言條件的內容。"
 
-    st.info(f"篩選後剩下 {len(df_comments_filtered)} 則符合條件的留言。")
-    if df_comments_filtered.empty:
-        return None, "在抓取的留言中找不到符合語言條件的內容。"
+    # 粵語分數
+    df_comments["cantonese_score"] = df_comments["comment_text"].apply(score_cantonese)
 
-    # 時區處理與日期範圍二次校驗
-    df_comments_filtered["published_at"] = pd.to_datetime(df_comments_filtered["published_at"], utc=True, errors="coerce")
-    df_comments_filtered["published_at_hk"] = df_comments_filtered["published_at"].dt.tz_convert("Asia/Hong_Kong")
+    # 5) 粵語門檻 + 自動放寬
+    thr = float(cantonese_threshold)
+    def filt(t): return t >= thr
+    df_filtered = df_comments[df_comments["cantonese_score"].apply(filt)].reset_index(drop=True)
+
+    if auto_relax_threshold and len(df_filtered) < target_min_cantonese:
+        # 逐步放寬到最低 0.5
+        new_thr = thr
+        while len(df_filtered) < target_min_cantonese and new_thr > 0.5:
+            new_thr = round(new_thr - 0.5, 2)
+            df_filtered = df_comments[df_comments["cantonese_score"] >= new_thr].reset_index(drop=True)
+        if new_thr != thr:
+            st.info(f"自動放寬粵語分數門檻：{thr} ➜ {new_thr}（目前符合條件留言：{len(df_filtered)}）")
+            thr = new_thr
+
+    st.info(f"語言與粵語篩選後剩下 {len(df_filtered)} 則留言（門檻={thr}）。")
+    if df_filtered.empty:
+        return None, "粵語篩選後樣本為 0，請調低門檻或延長時間範圍。"
+
+    # 6) 時區與日期篩選
+    df_filtered["published_at"] = pd.to_datetime(df_filtered["published_at"], utc=True, errors="coerce")
+    df_filtered["published_at_hk"] = df_filtered["published_at"].dt.tz_convert("Asia/Hong_Kong")
 
     start_dt = pd.to_datetime(start_date).tz_localize("Asia/Hong_Kong")
     end_dt = pd.to_datetime(end_date).tz_localize("Asia/Hong_Kong") + timedelta(days=1)
-    mask_date = (df_comments_filtered["published_at_hk"] >= start_dt) & (df_comments_filtered["published_at_hk"] < end_dt)
-    df_comments_filtered = df_comments_filtered.loc[mask_date].reset_index(drop=True)
-    if df_comments_filtered.empty:
-        return None, "在指定日期範圍內沒有符合語言條件的留言。"
+    mask_date = (df_filtered["published_at_hk"] >= start_dt) & (df_filtered["published_at_hk"] < end_dt)
+    df_filtered = df_filtered.loc[mask_date].reset_index(drop=True)
+    if df_filtered.empty:
+        return None, "在指定日期範圍內沒有符合粵語條件的留言。"
 
-    # 取樣控制
-    if sample_size and 0 < sample_size < len(df_comments_filtered):
-        df_analyze = df_comments_filtered.sample(n=sample_size, random_state=42)
+    # 7) 取樣控制
+    if sample_size and 0 < sample_size < len(df_filtered):
+        df_analyze = df_filtered.sample(n=sample_size, random_state=42)
     else:
-        df_analyze = df_comments_filtered
+        df_analyze = df_filtered
 
     st.info(f"準備對 {len(df_analyze)} 則留言進行高速並發分析...")
 
-    # 異步分析並對齊
+    # 8) 異步分析 + 對齊
     analysis_results = asyncio.run(run_all_analyses(df_analyze, deepseek_client))
     analysis_df = pd.DataFrame(analysis_results)
-
     final_df = pd.concat([df_analyze.reset_index(drop=True), analysis_df], axis=1)
-    final_df["published_at"] = pd.to_datetime(final_df["published_at"])
 
+    # 整理時間列
+    final_df["published_at"] = pd.to_datetime(final_df["published_at"])
     return final_df, None
 
 
@@ -414,16 +547,15 @@ def movie_comment_analysis(
 # 5. Streamlit UI
 # =========================
 
-st.set_page_config(page_title="YouTube 電影評論 AI 分析", layout="wide")
-st.title("🎬 YouTube 電影評論 AI 情感分析")
+st.set_page_config(page_title="YouTube 電影評論 AI 分析（香港粵語優先）", layout="wide")
+st.title("🎬 YouTube 電影評論 AI 情感分析（香港粵語優先）")
 
 with st.expander("使用說明"):
     st.markdown("""
     1.  輸入電影的中文全名、分析時間範圍及所需的 API 金鑰。
-    2.  自訂每個關鍵字搜尋的影片數量上限，及每部影片抓取的留言數量上限。
-    3.  系統將自動抓取 YouTube 留言，剔除日文，並以繁體為主要目標語言進行 AI 情感分析。
-        你可選擇是否「放寬繁體判定」，以增加樣本量。
-    4.  分析完成後，下方會顯示數據圖表及詳細結果的下載按鈕。
+    2.  本工具會偏向抓取香港地區的影片與留言，並用粵語特徵打分過濾。
+    3.  可調整「粵語分數門檻」與「自動放寬」確保樣本量；同時剔除日文與簡體為主的留言。
+    4.  分析完成後，提供可視化與 CSV 下載（含來源影片標題與連結）。
     """)
 
 movie_title = st.text_input("電影名稱 (建議使用香港通用的中文全名)", value="九龍城寨之圍城")
@@ -436,22 +568,31 @@ yt_api_key = st.text_input("YouTube API Key", type='password')
 deepseek_api_key = st.text_input("DeepSeek API Key", type='password')
 
 st.subheader("進階設定")
-max_videos = st.slider("每個關鍵字的最大影片搜尋數", 5, 80, 30, help="增加此數值會找到更多影片，但會增加 YouTube API 的配額消耗。")
+max_videos = st.slider("每個關鍵字的最大影片搜尋數", 5, 80, 30, help="提高可增加覆蓋，但會增加 YouTube API 配額消耗。")
 max_comments = st.slider("每部影片的最大留言抓取數", 10, 200, 80, help="數量越多，分析結果越全面，但 DeepSeek API 成本越高。")
-sample_size = st.number_input("分析留言數量上限 (0 代表分析全部已抓取的留言)", 0, 5000, 500, help="例如抓取了 2000 則留言，這裡設 500 就只會分析其中的 500 則。")
-relax_trad_filter = st.checkbox("放寬繁體判定（允許疑似中文但無法判別繁／簡的留言）", value=True)
+sample_size = st.number_input("分析留言數量上限 (0=全量)", 0, 5000, 500)
+
+relax_trad_filter = st.checkbox("放寬繁體判定（允許難分的中文留言）", value=True)
+prefer_hk_videos = st.checkbox("優先抓取更可能來自香港/粵語的影片（排序加權）", value=True)
+
+cantonese_threshold = st.slider("粵語分數門檻", 0.5, 6.0, 2.0, 0.5, help="分數越高越嚴格，2.0 是較穩健的門檻。")
+auto_relax_threshold = st.checkbox("自動放寬門檻以達到目標樣本量", value=True)
+target_min_cantonese = st.number_input("目標最少粵語評論數（啟用自動放寬時生效）", 50, 2000, 300)
 
 if st.button("🚀 開始分析"):
     if not all([movie_title, yt_api_key, deepseek_api_key]):
         st.warning("請填寫電影名稱和兩個 API 金鑰。")
     else:
-        result_container = st.container()
         with st.spinner("AI 高速分析中... 請稍候..."):
             df_result, err = movie_comment_analysis(
                 movie_title, str(start_date), str(end_date),
                 yt_api_key, deepseek_api_key,
                 max_videos, max_comments, sample_size,
-                relax_trad_filter=relax_trad_filter
+                relax_trad_filter=relax_trad_filter,
+                cantonese_threshold=cantonese_threshold,
+                auto_relax_threshold=auto_relax_threshold,
+                target_min_cantonese=target_min_cantonese,
+                prefer_hk_videos=prefer_hk_videos
             )
 
         if err:
@@ -462,35 +603,31 @@ if st.button("🚀 開始分析"):
 
             st.header("📊 可視化分析結果")
 
-            # 共用設定
             sentiments_order = ['Positive', 'Negative', 'Neutral', 'Invalid', 'Error']
             colors_map = {
                 'Positive': '#5cb85c', 'Negative': '#d9534f', 'Neutral': '#f0ad4e',
                 'Invalid': '#cccccc', 'Error': '#888888'
             }
 
-            # 1. 情感分佈圓餅圖
+            # 1. 情感分佈
             st.subheader("1. Sentiment Distribution (Pie)")
             sentiment_series = df_result['sentiment'].dropna().astype(str)
             sentiment_counts = sentiment_series.value_counts()
             ordered_labels = [label for label in sentiments_order if label in sentiment_counts.index]
-
             if not sentiment_counts.empty:
                 fig1 = px.pie(
                     values=sentiment_counts[ordered_labels].values,
                     names=ordered_labels,
                     title='Overall Sentiment Distribution',
                     color=ordered_labels,
-                    color_discrete_map=colors_map,
-                    hole=0.0
+                    color_discrete_map=colors_map
                 )
                 st.plotly_chart(fig1, use_container_width=True)
             else:
                 st.info("No sentiment data available for pie chart.")
 
-            # 2. 每日情感趨勢圖
+            # 2. 每日情感趨勢
             st.subheader("2. Daily Sentiment Trend")
-
             if 'published_at_hk' in df_result.columns:
                 df_result['date'] = df_result['published_at_hk'].dt.date
             else:
@@ -498,27 +635,21 @@ if st.button("🚀 開始分析"):
 
             daily = df_result.groupby(['date', 'sentiment']).size().unstack().fillna(0)
             daily = daily.reindex(columns=sentiments_order).dropna(axis=1, how='all')
-
             if not daily.empty:
                 daily_long = daily.reset_index().melt(id_vars='date', var_name='sentiment', value_name='count')
-
-                st.markdown("#### 每日情感趨勢 (折線圖)")
                 fig_line = px.line(
                     daily_long, x='date', y='count', color='sentiment',
                     title='Daily Comment Volume Trend by Sentiment',
                     labels={'date': 'Date', 'count': 'Number of Comments', 'sentiment': 'Sentiment'},
-                    color_discrete_map=colors_map,
-                    category_orders={'sentiment': [col for col in sentiments_order if col in daily.columns]}
+                    color_discrete_map=colors_map
                 )
                 st.plotly_chart(fig_line, use_container_width=True)
 
-                st.markdown("#### 每日留言總量及情感分佈 (堆疊長條圖)")
                 fig_bar = px.bar(
                     daily_long, x='date', y='count', color='sentiment',
                     title='Daily Comment Volume by Sentiment (Stacked)',
                     labels={'date': 'Date', 'count': 'Number of Comments', 'sentiment': 'Sentiment'},
                     color_discrete_map=colors_map,
-                    category_orders={'sentiment': [col for col in sentiments_order if col in daily.columns]},
                     barmode='stack'
                 )
                 st.plotly_chart(fig_bar, use_container_width=True)
@@ -529,7 +660,6 @@ if st.button("🚀 開始分析"):
             st.subheader("3. Sentiment Share by Topic")
             topic_sentiment = df_result.groupby(['topic', 'sentiment']).size().unstack().fillna(0)
             topic_sentiment = topic_sentiment.reindex(columns=sentiments_order).dropna(axis=1, how='all')
-
             if not topic_sentiment.empty:
                 topic_sentiment = topic_sentiment[topic_sentiment.sum(axis=1) > 0]
                 if not topic_sentiment.empty:
@@ -547,12 +677,12 @@ if st.button("🚀 開始分析"):
             else:
                 st.info("Not enough topic sentiment data to display the stacked bar chart.")
 
-            # 4. 下載分析明細（新增 video_title / video_url）
+            # 4. 下載分析明細（含 video_title / video_url / video_hk_score）
             st.subheader("4. 下載分析明細")
             csv = df_result.to_csv(index=False, encoding='utf-8-sig')
             st.download_button(
                 "📥 下載全部分析明細 (CSV)",
                 csv,
-                file_name=f"{movie_title}_analysis_details.csv",
+                file_name=f"{movie_title}_hk_cantonese_analysis.csv",
                 mime='text/csv'
             )
