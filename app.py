@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from googleapiclient.discovery import build
-from textblob import TextBlob
 import plotly.express as px
 import plotly.graph_objects as go
 from collections import Counter
@@ -15,16 +14,34 @@ from datetime import datetime
 
 st.set_page_config(page_title="YouTube Movie Sentiment Analysis", layout="wide")
 
-# Basic stop words list (English) to avoid importing NLTK
+# ---------------------------------------------------------
+# NATIVE SENTIMENT DICTIONARY (No external libraries needed)
+# ---------------------------------------------------------
+POSITIVE_WORDS = {
+    'good', 'great', 'excellent', 'amazing', 'love', 'best', 'awesome', 
+    'fantastic', 'happy', 'enjoy', 'beautiful', 'nice', 'perfect', 'fun', 
+    'funny', 'interesting', 'brilliant', 'wonderful', 'super', 'cool', 
+    'entertaining', 'masterpiece', 'loved', 'likes', 'excited', 'incredible',
+    'touching', 'emotional', 'epic', 'legendary', 'classic', 'solid', 'recommend'
+}
+
+NEGATIVE_WORDS = {
+    'bad', 'terrible', 'awful', 'worst', 'hate', 'boring', 'disappointing', 
+    'poor', 'horrible', 'waste', 'stupid', 'annoying', 'sad', 'disaster', 
+    'fail', 'ugly', 'mess', 'trash', 'useless', 'dumb', 'cringe', 'weak',
+    'confusing', 'slow', 'dry', 'predictable', 'cliche', 'unfunny', 'garbage',
+    'ruined', 'cheap', 'lazy', 'pointless'
+}
+
 STOPWORDS = {
     'the', 'a', 'an', 'in', 'on', 'at', 'of', 'to', 'is', 'are', 'was', 'were',
     'and', 'but', 'or', 'so', 'it', 'this', 'that', 'my', 'your', 'his', 'her',
-    'movie', 'film', 'video', 'really', 'very', 'just', 'like', 'good', 'bad',
-    'watch', 'watching', 'time', 'people', 'think', 'know', 'would', 'could',
-    'should', 'get', 'got', 'make', 'made', 'see', 'saw', 'seen', 'one', 'much',
-    'many', 'well', 'way', 'even', 'also', 'back', 'go', 'going', 'want',
-    'did', 'do', 'does', 'done', 'actually', 'literally', 'thing', 'things',
-    'something', 'anything', 'nothing', 'say', 'said', 'says', 'story', 'character'
+    'movie', 'film', 'video', 'really', 'very', 'just', 'like', 'watch', 
+    'watching', 'time', 'people', 'think', 'know', 'would', 'could', 'should', 
+    'get', 'got', 'make', 'made', 'see', 'saw', 'seen', 'one', 'much', 'many', 
+    'well', 'way', 'even', 'also', 'back', 'go', 'going', 'want', 'did', 'do', 
+    'does', 'done', 'actually', 'literally', 'thing', 'things', 'something', 
+    'anything', 'nothing', 'say', 'said', 'says', 'story', 'character', 'plot'
 }
 
 def clean_text(text):
@@ -34,20 +51,33 @@ def clean_text(text):
     text = html.unescape(text)
     text = re.sub(r'<[^>]+>', '', text)  # Remove HTML tags
     text = re.sub(r'http\S+', '', text)  # Remove URLs
-    text = re.sub(r'[^\w\s]', '', text)  # Remove punctuation
+    text = re.sub(r'[^\w\s]', ' ', text) # Replace punctuation with space
     text = text.lower().strip()
     return text
 
-def get_sentiment(text):
-    """Returns sentiment polarity (-1 to 1)."""
-    blob = TextBlob(text)
-    return blob.sentiment.polarity
+def get_native_sentiment(text):
+    """
+    Calculates sentiment score (-1 to 1) based on word matches.
+    Returns 0.0 if no sentiment words are found.
+    """
+    words = text.split()
+    pos_count = sum(1 for w in words if w in POSITIVE_WORDS)
+    neg_count = sum(1 for w in words if w in NEGATIVE_WORDS)
+    
+    total_matches = pos_count + neg_count
+    
+    if total_matches == 0:
+        return 0.0
+    
+    # Normalize score between -1 and 1
+    # Formula: (Positive - Negative) / Total Matches
+    return (pos_count - neg_count) / total_matches
 
 def get_sentiment_label(score):
     """Converts score to label."""
-    if score > 0.1:
+    if score > 0.05:
         return "Positive"
-    elif score < -0.1:
+    elif score < -0.05:
         return "Negative"
     else:
         return "Neutral"
@@ -63,8 +93,7 @@ def search_videos_strict(api_key, query, max_videos_to_keep=5):
     """
     youtube = build('youtube', 'v3', developerKey=api_key)
     
-    # We fetch more results (e.g., 20) than we need (e.g., 5)
-    # This allows us to discard irrelevant videos without making a second API call.
+    # We fetch more results (20) to allow for filtering
     fetch_count = 20 
     
     try:
@@ -89,12 +118,9 @@ def search_videos_strict(api_key, query, max_videos_to_keep=5):
         title = snippet['title']
         
         # --- STRICT FILTERING LOGIC ---
-        # If the user's search term is NOT in the video title, discard it.
-        # This removes random "trending" videos (news, gossip) that YouTube inserts.
         if query_lower not in title.lower():
             continue
             
-        # Store valid video data
         video_data = {
             'video_id': vid,
             'title': title,
@@ -104,7 +130,6 @@ def search_videos_strict(api_key, query, max_videos_to_keep=5):
         }
         valid_videos.append(video_data)
         
-        # Stop once we have enough valid videos
         if len(valid_videos) >= max_videos_to_keep:
             break
 
@@ -119,7 +144,7 @@ def get_video_comments(api_key, video_id, max_comments=100):
         request = youtube.commentThreads().list(
             part="snippet",
             videoId=video_id,
-            maxResults=min(max_comments, 100), # API limit is 100 per page
+            maxResults=min(max_comments, 100),
             textFormat="plainText",
             order="relevance"
         )
@@ -146,7 +171,6 @@ def get_video_comments(api_key, video_id, max_comments=100):
                 break
                 
     except Exception:
-        # Ignore errors (e.g., comments disabled) to keep flow running
         pass
         
     return comments
@@ -154,7 +178,7 @@ def get_video_comments(api_key, video_id, max_comments=100):
 def analyze_data(api_key, query, num_videos, num_comments_per_video):
     """Orchestrates the search, fetch, and analysis process."""
     
-    # 1. Search with Strict Filtering
+    # 1. Search
     video_ids, videos_meta = search_videos_strict(api_key, query, max_videos_to_keep=num_videos)
     
     if not video_ids:
@@ -165,10 +189,8 @@ def analyze_data(api_key, query, num_videos, num_comments_per_video):
     progress_bar = st.progress(0)
     
     for i, vid in enumerate(video_ids):
-        # Update progress
         progress = int((i / len(video_ids)) * 100)
         progress_bar.progress(progress)
-        
         vid_comments = get_video_comments(api_key, vid, max_comments=num_comments_per_video)
         all_comments.extend(vid_comments)
         
@@ -177,15 +199,14 @@ def analyze_data(api_key, query, num_videos, num_comments_per_video):
     if not all_comments:
         return videos_meta, pd.DataFrame()
 
-    # 3. Sentiment Analysis
+    # 3. Sentiment Analysis (Native Python)
     df = pd.DataFrame(all_comments)
     df['clean_text'] = df['text'].apply(clean_text)
-    df['sentiment_score'] = df['clean_text'].apply(get_sentiment)
+    df['sentiment_score'] = df['clean_text'].apply(get_native_sentiment)
     df['sentiment_label'] = df['sentiment_score'].apply(get_sentiment_label)
     
     # 4. Date Processing
     df['published_at'] = pd.to_datetime(df['published_at'])
-    # Convert to UTC then to Hong Kong time
     if df['published_at'].dt.tz is None:
          df['published_at'] = df['published_at'].dt.tz_localize('UTC')
     df['published_at_hk'] = df['published_at'].dt.tz_convert('Asia/Hong_Kong')
@@ -244,7 +265,11 @@ if start_btn and api_key and movie_name:
             c1, c2, c3 = st.columns(3)
             c1.metric("Total Comments", len(df_comments))
             c2.metric("Avg Sentiment", f"{avg_sentiment:.2f}")
-            c3.metric("Positive Ratio", f"{(sentiment_counts.get('Positive',0)/len(df_comments)*100):.1f}%")
+            
+            pos_count = sentiment_counts.get('Positive', 0)
+            total_count = len(df_comments)
+            ratio = (pos_count / total_count * 100) if total_count > 0 else 0
+            c3.metric("Positive Ratio", f"{ratio:.1f}%")
             
             # --- Charts ---
             col_chart1, col_chart2 = st.columns(2)
@@ -263,13 +288,17 @@ if start_btn and api_key and movie_name:
             with col_chart2:
                 # Word Cloud (Bar Chart)
                 all_words = ' '.join(df_comments['clean_text']).split()
+                # Filter out stopwords and short words
                 filtered_words = [w for w in all_words if w not in STOPWORDS and len(w) > 2]
                 word_counts = Counter(filtered_words).most_common(10)
                 df_words = pd.DataFrame(word_counts, columns=['Word', 'Count'])
                 
-                fig_bar = px.bar(df_words, x='Count', y='Word', orientation='h', title="Top Keywords")
-                fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
-                st.plotly_chart(fig_bar, use_container_width=True)
+                if not df_words.empty:
+                    fig_bar = px.bar(df_words, x='Count', y='Word', orientation='h', title="Top Keywords")
+                    fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                else:
+                    st.info("Not enough data for keywords.")
 
             # --- Time Series ---
             st.subheader("📅 Sentiment Over Time")
