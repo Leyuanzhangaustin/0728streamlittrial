@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple, Any, Optional
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -674,7 +675,116 @@ def movie_comment_analysis(
 
 
 # =========================
-# 4. Streamlit 介面
+# 4. 視覺化
+# =========================
+
+def render_visualizations(df: pd.DataFrame) -> None:
+    st.markdown("### 📈 視覺化洞察")
+
+    if df.empty:
+        st.info("沒有資料可視覺化。")
+        return
+
+    # 情緒分佈
+    sentiment_counts = (
+        df["analysis_sentiment"]
+        .fillna("未分析")
+        .value_counts()
+        .reset_index()
+        .rename(columns={"index": "sentiment", "analysis_sentiment": "count"})
+    )
+
+    sentiment_chart = (
+        alt.Chart(sentiment_counts)
+        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+        .encode(
+            x=alt.X("sentiment:N", title="情緒分類"),
+            y=alt.Y("count:Q", title="留言數"),
+            color=alt.Color(
+                "sentiment:N",
+                scale=alt.Scale(
+                    domain=["positive", "neutral", "negative", "未分析"],
+                    range=["#16a34a", "#facc15", "#dc2626", "#9ca3af"]
+                ),
+                legend=None
+            ),
+            tooltip=["sentiment:N", "count:Q"]
+        )
+    ).properties(
+        width="container",
+        height=320,
+        title="留言情緒分佈"
+    )
+
+    st.altair_chart(sentiment_chart, use_container_width=True)
+
+    # 日期趨勢
+    date_df = df.dropna(subset=["comment_published_at_hk"]).copy()
+    if not date_df.empty:
+        date_df["comment_date"] = date_df["comment_published_at_hk"].dt.date
+        daily_counts = (
+            date_df.groupby("comment_date")
+            .size()
+            .reset_index(name="count")
+        )
+
+        daily_chart = (
+            alt.Chart(daily_counts)
+            .mark_area(line={"color": "#2563eb"}, color="#2563eb40")
+            .encode(
+                x=alt.X("comment_date:T", title="日期"),
+                y=alt.Y("count:Q", title="每日留言數"),
+                tooltip=[alt.Tooltip("comment_date:T", title="日期"), alt.Tooltip("count:Q", title="留言數")]
+            )
+        ).properties(
+            width="container",
+            height=320,
+            title="每日留言量趨勢（香港時間）"
+        )
+
+        st.altair_chart(daily_chart, use_container_width=True)
+    else:
+        st.info("留言缺少時間資訊，無法顯示日期趨勢。")
+
+    # 熱門標籤
+    tag_series = (
+        df["analysis_tags"]
+        .dropna()
+        .explode()
+        .astype(str)
+        .str.strip()
+    )
+    tag_series = tag_series[tag_series != ""]
+    if not tag_series.empty:
+        top_tags = (
+            tag_series.value_counts()
+            .head(15)
+            .reset_index()
+            .rename(columns={"index": "tag", "analysis_tags": "count"})
+        )
+
+        tag_chart = (
+            alt.Chart(top_tags)
+            .mark_bar()
+            .encode(
+                x=alt.X("count:Q", title="出現次數"),
+                y=alt.Y("tag:N", title="標籤", sort="-x"),
+                color=alt.Color("count:Q", scale=alt.Scale(scheme="blues"), legend=None),
+                tooltip=["tag:N", "count:Q"]
+            )
+        ).properties(
+            width="container",
+            height=360,
+            title="熱門語意標籤 Top 15"
+        )
+
+        st.altair_chart(tag_chart, use_container_width=True)
+    else:
+        st.info("語意分析未產出標籤，無法顯示熱門標籤圖。")
+
+
+# =========================
+# 5. Streamlit 介面
 # =========================
 
 def main():
@@ -801,6 +911,9 @@ def main():
             return
 
         st.success(f"共分析 {len(df_result)} 則留言。")
+
+        render_visualizations(df_result)
+
         st.markdown("### 📊 分析結果一覽")
         st.dataframe(
             df_result[
