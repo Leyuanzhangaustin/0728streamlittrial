@@ -14,11 +14,12 @@ from opencc import OpenCC
 from googleapiclient.discovery import build
 
 # =========================
-# 0. 快取與工具函式 (新增部分)
+# 0. 快取與工具函式
 # =========================
 
 # 快取過期時間設定
 CACHE_TTL_SEARCH = 3600          # 1 小時：搜尋結果
+CACHE_TTL_RELEVANCE = 86400      # 24 小時：AI 相關性判斷結果（影片標題不變，判斷結果就不變）
 CACHE_TTL_CHANNEL = 86400        # 24 小時：頻道國家資訊
 CACHE_TTL_COMMENTS = 900         # 15 分鐘：留言清單
 
@@ -29,11 +30,9 @@ def _get_cached_value(cache_name: str, key, ttl_seconds: int):
     
     entry = st.session_state[cache_name].get(key)
     if entry:
-        # 檢查是否過期
         if (time.time() - entry["ts"]) <= ttl_seconds:
             return entry["value"]
         else:
-            # 過期則刪除
             del st.session_state[cache_name][key]
     return None
 
@@ -51,9 +50,6 @@ def _set_cached_value(cache_name: str, key, value):
 # =========================
 
 def generate_search_queries(movie_title: str):
-    """
-    生成偏向香港/粵語的寬鬆關鍵字組合 + 少量精確短語。
-    """
     zh_terms = [
         "影評", "評論", "評價", "點評", "解析", "分析", "觀後感",
         "無雷", "有雷", "討論", "好唔好睇", "預告", "花絮", "片段", "首映", "幕後",
@@ -90,7 +86,6 @@ def generate_search_queries(movie_title: str):
             seen.add(q)
     return queries
 
-# 粵語標記詞與權重
 CANTONESE_CHAR_TOKENS = {
     "唔": 1.0, "冇": 1.6, "咗": 1.6, "嘅": 1.6, "啲": 1.2, "嗰": 1.2, "佢": 1.0,
     "喺": 1.6, "嚟": 1.6, "咪": 1.2, "啱": 1.2, "掂": 1.2, "靚": 1.2, "曳": 1.2,
@@ -192,37 +187,29 @@ def search_youtube_videos(
     end_date,
     add_language_bias=True,
     region_bias=True,
-    max_total_videos=150  # 新增：全域上限，防止配額爆炸
+    max_total_videos=150
 ):
     all_video_ids = set()
     video_meta = {}
-    
-    # 用來顯示進度的 placeholder
     status_text = st.empty()
 
     for idx, query in enumerate(keywords):
-        # 檢查全域上限
         if len(all_video_ids) >= max_total_videos:
-            status_text.info(f"已達到全域影片上限 ({max_total_videos} 部)，停止後續搜尋以節省配額。")
+            status_text.info(f"已達到搜尋上限 ({max_total_videos} 部)，停止後續搜尋。")
             break
 
-        # 建立快取 Key
         cache_key = f"{query}_{start_date}_{end_date}_{max_per_keyword}_{add_language_bias}_{region_bias}"
         cached_data = _get_cached_value("search_cache", cache_key, CACHE_TTL_SEARCH)
 
         query_records = []
 
         if cached_data is not None:
-            # 命中快取
             query_records = cached_data
-            # status_text.text(f"關鍵字 '{query}' 命中快取，跳過 API。")
         else:
-            # 未命中，呼叫 API
             collected_records = []
             collected_ids_for_query = set()
             
             for order in ["relevance", "viewCount"]:
-                # 如果單一關鍵字已經抓夠了，就不跑第二種排序
                 if len(collected_records) >= max_per_keyword:
                     break
 
@@ -261,16 +248,14 @@ def search_youtube_videos(
                             break
                             
                         request = youtube_client.search().list_next(request, response)
-                        time.sleep(0.1) # 輕微延遲
+                        time.sleep(0.1)
                 except Exception as e:
                     st.warning(f"搜尋 '{query}' 時發生錯誤: {e}")
                     continue
             
-            # 存入快取
             _set_cached_value("search_cache", cache_key, collected_records)
             query_records = collected_records
 
-        # 整合結果
         for record in query_records:
             vid = record["video_id"]
             if vid not in all_video_ids:
@@ -287,14 +272,117 @@ def search_youtube_videos(
     status_text.empty()
     return list(all_video_ids), video_meta
 
+# =========================
+# NEW: AI 影片相關性過濾
+# =========================
+
+async def check_relevance_batch_async(movie_title, batch_videos, deepseek_client):
+    """
+    使用 DeepSeek 批量判斷影片是否與電影相關。
+    batch_videos: list of {"id": vid, "title": title, "channel": channel}
+    """
+    if not batch_videos:
+        return []
+
+    prompt_items = []
+    for v in batch_videos:
+        prompt_items.append(f"ID: {v['id']}\nTitle: {v['title']}\nChannel: {v['channel']}")
+    
+    prompt_text = "\n---\n".join(prompt_items)
+
+    system_prompt = (
+        f"You are a data cleaner. The user is analyzing the movie '{movie_title}'. "
+        "Below is a list of YouTube video titles found by search. "
+        "Identify which videos are actually discussing this specific movie (reviews, reactions, news, clips, interviews). "
+        "Exclude videos that are clearly unrelated (e.g., generic news, other movies, music videos not related to the film, or completely different topics). "
+        "Return a JSON object where keys are the Video IDs and values are boolean true (relevant) or false (irrelevant). "
+        "Example: {\"vid123\": true, \"vid456\": false}"
+    )
+
+    try:
+        response = await deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt_text}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+        data = json.loads(response.choices[0].message.content)
+        # 提取為 True 的 ID
+        valid_ids = [vid for vid, is_relevant in data.items() if is_relevant is True]
+        return valid_ids
+    except Exception as e:
+        # 如果 API 失敗，為了安全起見，默認保留（Fail Open），以免丟失數據
+        # 或者也可以選擇僅在失敗時保留包含電影名的
+        print(f"Relevance check failed: {e}")
+        return [v['id'] for v in batch_videos]
+
+async def filter_videos_by_relevance(movie_title, video_ids, video_meta, deepseek_client):
+    """
+    主入口：過濾影片列表
+    """
+    # 1. 檢查快取
+    to_check = []
+    valid_ids = set()
+    
+    for vid in video_ids:
+        cached_res = _get_cached_value("relevance_cache", f"{movie_title}_{vid}", CACHE_TTL_RELEVANCE)
+        if cached_res is not None:
+            if cached_res:
+                valid_ids.add(vid)
+        else:
+            meta = video_meta.get(vid, {})
+            to_check.append({
+                "id": vid,
+                "title": meta.get("title", ""),
+                "channel": meta.get("channelTitle", "")
+            })
+    
+    # 2. 批量送去 AI 檢查
+    if to_check:
+        batch_size = 20
+        tasks = []
+        
+        # 分批建立異步任務
+        for i in range(0, len(to_check), batch_size):
+            batch = to_check[i:i+batch_size]
+            tasks.append(check_relevance_batch_async(movie_title, batch, deepseek_client))
+        
+        # 執行任務
+        progress_text = st.empty()
+        progress_text.info(f"正在使用 AI 過濾 {len(to_check)} 部影片的相關性...")
+        
+        results = await asyncio.gather(*tasks)
+        
+        # 整合結果並寫入快取
+        for batch_idx, relevant_list in enumerate(results):
+            batch_input = to_check[batch_idx*batch_size : (batch_idx+1)*batch_size]
+            # 建立一個 lookup set
+            rel_set = set(relevant_list)
+            
+            for item in batch_input:
+                vid = item["id"]
+                is_rel = vid in rel_set
+                if is_rel:
+                    valid_ids.add(vid)
+                
+                # 寫入快取
+                _set_cached_value("relevance_cache", f"{movie_title}_{vid}", is_rel)
+        
+        progress_text.empty()
+
+    return list(valid_ids)
+
+# =========================
+# 3. 獲取詳情與留言
+# =========================
+
 def fetch_video_and_channel_details(video_ids, youtube_client):
-    """
-    優化版：針對 Channel Country 進行快取，減少 channels.list 呼叫
-    """
     video_extra = {}
     channel_ids = set()
 
-    # 1. 獲取影片詳情 (videos.list 較難快取，因為 tags 可能變動，且 batch 處理較快)
     for i in range(0, len(video_ids), 50):
         chunk = video_ids[i:i+50]
         try:
@@ -317,7 +405,6 @@ def fetch_video_and_channel_details(video_ids, youtube_client):
         except Exception as e:
             st.warning(f"videos.list 取資料時發生錯誤: {e}")
 
-    # 2. 獲取頻道詳情 (使用快取)
     channel_country = {}
     channels_to_fetch = []
 
@@ -328,7 +415,6 @@ def fetch_video_and_channel_details(video_ids, youtube_client):
         else:
             channels_to_fetch.append(cid)
     
-    # 只抓取未快取的頻道
     if channels_to_fetch:
         for i in range(0, len(channels_to_fetch), 50):
             chunk = channels_to_fetch[i:i+50]
@@ -342,7 +428,6 @@ def fetch_video_and_channel_details(video_ids, youtube_client):
                     brand = (item.get("brandingSettings", {}) or {}).get("channel", {}) or {}
                     country = brand.get("country")
                     channel_country[cid] = country
-                    # 寫入快取
                     _set_cached_value("channel_cache", cid, country)
             except Exception as e:
                 st.warning(f"channels.list 取資料時發生錯誤: {e}")
@@ -369,14 +454,10 @@ def compute_hk_video_score(video_id, video_meta, video_extra, channel_country_ma
     if any(tok in tags for tok in ["粵語", "廣東話", "香港", "HK"]): score += 2
     return score
 
-# =========================
-# 3. 批量抓取留言 (含快取與總量控制)
-# =========================
-
 def get_all_comments(
     video_ids, youtube_client, max_per_video, 
     video_meta=None, hk_score_map=None, video_extra=None, channel_country_map=None,
-    max_total_comments=2000  # 全域留言上限
+    max_total_comments=2000
 ):
     video_meta = video_meta or {}
     hk_score_map = hk_score_map or {}
@@ -387,11 +468,9 @@ def get_all_comments(
     total_videos = len(video_ids)
     progress_bar = st.progress(0, text="抓取 YouTube 留言中...")
     
-    # 為了避免配額浪費，我們統計實際抓到的數量
     total_fetched_count = 0
 
     for i, video_id in enumerate(video_ids):
-        # 檢查全域上限
         if total_fetched_count >= max_total_comments:
             break
 
@@ -401,10 +480,8 @@ def get_all_comments(
         current_video_comments = []
 
         if cached_comments is not None:
-            # 命中快取
             current_video_comments = cached_comments
         else:
-            # 呼叫 API
             try:
                 request = youtube_client.commentThreads().list(
                     part="snippet",
@@ -417,7 +494,6 @@ def get_all_comments(
                 raw_records = []
                 
                 while request and fetched_for_video < max_per_video:
-                    # 如果總量已經爆了，就不要再翻頁了
                     if total_fetched_count + fetched_for_video >= max_total_comments:
                         break
 
@@ -427,7 +503,6 @@ def get_all_comments(
                             break
                         comment = item["snippet"]["topLevelComment"]["snippet"]
                         
-                        # 這裡只存原始數據進快取結構，稍後再豐富化
                         record = {
                             "textDisplay": comment.get("textDisplay", ""),
                             "publishedAt": comment.get("publishedAt", ""),
@@ -440,15 +515,13 @@ def get_all_comments(
                     if request and fetched_for_video < max_per_video:
                         time.sleep(0.1)
                 
-                # 寫入快取 (只存這個 video 的 raw data)
                 if raw_records:
                     _set_cached_value("comments_cache", cache_key, raw_records)
                 current_video_comments = raw_records
 
             except Exception:
-                pass # 忽略禁言或錯誤的影片
+                pass
 
-        # 將原始數據轉換為 DataFrame 需要的格式
         ch_id = (video_extra.get(video_id, {}) or {}).get("channelId")
         ch_country = channel_country_map.get(ch_id) if ch_id else None
         def_audio = (video_extra.get(video_id, {}) or {}).get("defaultAudioLanguage", "")
@@ -480,7 +553,7 @@ def get_all_comments(
     return pd.DataFrame(all_comments)
 
 # =========================
-# 4. DeepSeek AI 異步情感分析
+# 4. DeepSeek AI 情感分析
 # =========================
 
 async def analyze_comment_deepseek_async(comment_text, deepseek_client, semaphore, max_retries=3):
@@ -520,7 +593,6 @@ async def analyze_comment_deepseek_async(comment_text, deepseek_client, semaphor
                     return {"sentiment": "Error", "topic": "Error", "summary": f"API Error: {e}"}
 
 async def run_all_analyses(df, deepseek_client):
-    # DeepSeek 限制較寬鬆，但仍建議控制並發
     semaphore = asyncio.Semaphore(50)
     tasks = []
 
@@ -554,12 +626,9 @@ def movie_comment_analysis(
     target_min_cantonese=300,
     prefer_hk_videos=True
 ):
-    # 計算全域上限 (Heuristic)
-    # 如果使用者只要分析 500 則，我們不需要抓 10000 則留言。
-    # 考慮到過濾率（非粵語會被篩掉），我們抓取樣本數的 3-5 倍作為安全邊際。
     target_sample = sample_size if sample_size and sample_size > 0 else 1000
     GLOBAL_MAX_COMMENTS = max(2000, target_sample * 4) 
-    GLOBAL_MAX_VIDEOS = 150 # 限制搜尋總影片數，避免關鍵字太多導致 Search API 爆炸
+    GLOBAL_MAX_VIDEOS = 150
 
     SEARCH_KEYWORDS = generate_search_queries(movie_title)
 
@@ -569,7 +638,7 @@ def movie_comment_analysis(
         base_url="https://api.deepseek.com/v1"
     )
 
-    # 1) 搜尋 (帶全域上限)
+    # 1) 搜尋
     video_ids, video_meta = search_youtube_videos(
         SEARCH_KEYWORDS, youtube_client, max_videos_per_keyword, start_date, end_date,
         add_language_bias=True, region_bias=True,
@@ -577,14 +646,29 @@ def movie_comment_analysis(
     )
     if not video_ids:
         return None, "找不到相關影片。"
+    
+    st.info(f"初步搜尋到 {len(video_ids)} 部影片，正在進行 AI 相關性過濾...")
 
-    video_extra, channel_country_map = fetch_video_and_channel_details(video_ids, youtube_client)
+    # 2) NEW: AI 相關性過濾 (使用 DeepSeek)
+    relevant_video_ids = asyncio.run(filter_videos_by_relevance(movie_title, video_ids, video_meta, deepseek_client))
+    
+    removed_count = len(video_ids) - len(relevant_video_ids)
+    if removed_count > 0:
+        st.warning(f"AI 已過濾掉 {removed_count} 部與「{movie_title}」不相關的影片，保留 {len(relevant_video_ids)} 部進行分析。")
+    else:
+        st.info("所有搜尋到的影片均被判定為相關。")
 
-    # 2) 影片香港傾向排序
-    hk_score_map = {vid: compute_hk_video_score(vid, video_meta, video_extra, channel_country_map) for vid in video_ids}
-    video_ids_sorted = sorted(video_ids, key=lambda v: hk_score_map.get(v, 0), reverse=True) if prefer_hk_videos else video_ids
+    if not relevant_video_ids:
+        return None, "AI 過濾後沒有剩餘相關影片，請嘗試更換關鍵字或檢查電影名稱。"
 
-    # 3) 抓取留言 (帶全域上限)
+    # 3) 獲取詳細資料 (只針對相關影片)
+    video_extra, channel_country_map = fetch_video_and_channel_details(relevant_video_ids, youtube_client)
+
+    # 4) 影片香港傾向排序
+    hk_score_map = {vid: compute_hk_video_score(vid, video_meta, video_extra, channel_country_map) for vid in relevant_video_ids}
+    video_ids_sorted = sorted(relevant_video_ids, key=lambda v: hk_score_map.get(v, 0), reverse=True) if prefer_hk_videos else relevant_video_ids
+
+    # 5) 抓取留言
     df_comments = get_all_comments(
         video_ids_sorted, youtube_client, max_comments_per_video,
         video_meta=video_meta, hk_score_map=hk_score_map,
@@ -594,7 +678,7 @@ def movie_comment_analysis(
     if df_comments.empty:
         return None, "找不到任何留言。"
 
-    # 4) 語言過濾
+    # 6) 語言過濾
     st.info(f"已抓取 {len(df_comments)} 則原始留言，現開始語言與粵語篩選...")
 
     cc_t2s = OpenCC("t2s")
@@ -617,7 +701,7 @@ def movie_comment_analysis(
     # 粵語分數
     df_comments["cantonese_score"] = df_comments["comment_text"].apply(score_cantonese)
 
-    # 5) 粵語門檻 + 自動放寬
+    # 7) 粵語門檻 + 自動放寬
     thr = float(cantonese_threshold)
     def filt(t): return t >= thr
     df_filtered = df_comments[df_comments["cantonese_score"].apply(filt)].reset_index(drop=True)
@@ -635,7 +719,7 @@ def movie_comment_analysis(
     if df_filtered.empty:
         return None, "粵語篩選後樣本為 0，請調低門檻或延長時間範圍。"
 
-    # 6) 時區與日期篩選
+    # 8) 時區與日期篩選
     df_filtered["published_at"] = pd.to_datetime(df_filtered["published_at"], utc=True, errors="coerce")
     df_filtered["published_at_hk"] = df_filtered["published_at"].dt.tz_convert("Asia/Hong_Kong")
 
@@ -646,7 +730,7 @@ def movie_comment_analysis(
     if df_filtered.empty:
         return None, "在指定日期範圍內沒有符合粵語條件的留言。"
 
-    # 7) 取樣控制
+    # 9) 取樣控制
     if sample_size and 0 < sample_size < len(df_filtered):
         df_analyze = df_filtered.sample(n=sample_size, random_state=42)
     else:
@@ -654,7 +738,7 @@ def movie_comment_analysis(
 
     st.info(f"準備對 {len(df_analyze)} 則留言進行高速並發分析...")
 
-    # 8) DeepSeek 分析
+    # 10) DeepSeek 分析
     analysis_results = asyncio.run(run_all_analyses(df_analyze, deepseek_client))
     analysis_df = pd.DataFrame(analysis_results)
     final_df = pd.concat([df_analyze.reset_index(drop=True), analysis_df], axis=1)
@@ -673,7 +757,9 @@ with st.expander("使用說明"):
     st.markdown("""
     1.  輸入電影的中文全名、分析時間範圍及所需的 API 金鑰。
     2.  本工具會偏向抓取香港地區的影片與留言，並用粵語特徵打分過濾。
-    3.  **優化版**：已啟用結果快取與智能配額控制，重複查詢不會消耗 YouTube 配額。
+    3.  **優化版**：
+        *   **智能快取**：重複查詢不消耗 YouTube 配額。
+        *   **AI 相關性過濾**：使用 DeepSeek 自動剔除標題不相關的影片，確保分析精準度並節省 YouTube 留言抓取配額。
     4.  分析完成後，提供可視化與 CSV 下載。
     """)
 
