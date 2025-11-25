@@ -4,12 +4,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import time
 import asyncio
 import openai
 import re
 import json
+from collections import Counter
 from opencc import OpenCC
 from googleapiclient.discovery import build
 
@@ -42,7 +44,7 @@ def _set_cached_value(cache_name: str, key, value):
     }
 
 # =========================
-# 1. 語言與關鍵字工具 (已更新字典)
+# 1. 語言與關鍵字工具
 # =========================
 
 def generate_search_queries(movie_title: str):
@@ -79,23 +81,14 @@ def generate_search_queries(movie_title: str):
             seen.add(q)
     return queries
 
-# 更新：增加更多口語變體和俚語
+# 粵語特徵字典
 CANTONESE_CHAR_TOKENS = {
     "唔": 1.0, "冇": 1.6, "咗": 1.6, "嘅": 1.6, "啲": 1.2, "嗰": 1.2, "佢": 1.0,
     "喺": 1.6, "嚟": 1.6, "咪": 1.2, "啱": 1.2, "掂": 1.2, "靚": 1.2, "曳": 1.2,
     "攰": 1.2, "咁": 1.0, "噉": 1.0, "得": 0.6, "吖": 0.8, "冧": 1.0, "撚": 1.2,
     "仆": 1.2, "屌": 1.2, "嗮": 1.0, "畀": 0.8, "揸": 1.0, "腎": 0.0,
-    # 新增/調整
-    "系": 0.5,  # 很多人打錯字 "系" 代替 "係"，雖然簡體也有，但在繁體環境下出現通常是粵語
-    "係": 1.5,  # 核心詞
-    "9": 0.5,   # 數字俚語 (鳩/狗)
-    "7": 0.5,   # 數字俚語 (柒)
-    "6": 0.3,   # 數字俚語 (陸/碌)
-    "亞": 0.5,  # 亞媽, 亞哥 (阿的異體)
-    "野": 0.5,  # 嘢的異體
-    "既": 0.5,  # 嘅的異體
-    "左": 0.5,  # 咗的異體
-    "d": 0.8, "D": 0.8, # 啲的代號
+    "系": 0.5, "係": 1.5, "9": 0.5, "7": 0.5, "6": 0.3, "亞": 0.5, "野": 0.5,
+    "既": 0.5, "左": 0.5, "d": 0.8, "D": 0.8,
 }
 
 CANTONESE_PARTICLES = ["啦", "囉", "喎", "咩", "呢", "呀", "嘛", "喇", "杰", "姐", "噃"]
@@ -141,7 +134,6 @@ def classify_zh_trad_simp(text: str, cc_t2s: OpenCC, cc_s2t: OpenCC):
         return "other"
     counts = count_chars(text)
     
-    # 判斷是否主要為英文
     total_chars = len(text.strip())
     if counts["latin"] / max(1, total_chars) > 0.7:
         return "en"
@@ -152,7 +144,6 @@ def classify_zh_trad_simp(text: str, cc_t2s: OpenCC, cc_s2t: OpenCC):
     if kana >= 2 and kana / max(1, (cjk + kana)) >= 0.10:
         return "ja"
     if cjk < 1:
-        # 如果沒有中文字，但也不是英文，歸類為其他
         return "other" if counts["latin"] == 0 else "en"
 
     t2s = cc_t2s.convert(text)
@@ -171,18 +162,15 @@ def score_cantonese(text: str) -> float:
     if not isinstance(text, str) or not text:
         return 0.0
     score = 0.0
-    text_lower = text.lower() # 處理 d/D
+    text_lower = text.lower()
     
     for phrase, w in CANTONESE_PHRASES.items():
-        if phrase in text: # 區分大小寫的匹配 (中文)
+        if phrase in text:
             score += text.count(phrase) * w
             
     for ch, w in CANTONESE_CHAR_TOKENS.items():
-        # 對於英文代號 d/D，我們用 lower 檢查
         if ch in ['d', 'D']:
             cnt = text_lower.count('d')
-            # 簡單防止單詞中的 d (如 and, good) 被誤判，這裡只是一個粗略過濾
-            # 更好的方法是用 regex，但這裡從簡，假設 d 旁邊有中文或空格
             score += cnt * w * 0.5 
         else:
             cnt = text.count(ch)
@@ -194,7 +182,7 @@ def score_cantonese(text: str) -> float:
         if p in end_slice:
             score += 0.4
         elif p in text:
-            score += 0.2 # 非結尾語氣詞權重較低
+            score += 0.2
 
     roman_hits = ROMANIZATION_RE.findall(text)
     if roman_hits:
@@ -438,10 +426,9 @@ def get_all_comments(video_ids, youtube_client, max_per_video, video_meta, hk_sc
 # =========================
 
 async def analyze_comment_deepseek_async(comment_text, deepseek_client, semaphore, max_retries=3):
-    if not isinstance(comment_text, str) or len(comment_text.strip()) < 2: # 放寬長度限制
+    if not isinstance(comment_text, str) or len(comment_text.strip()) < 2:
         return {"sentiment": "Invalid", "topic": "N/A", "summary": "Too short."}
     
-    # 針對英文或短句的 Prompt 優化
     system_prompt = (
         "You are a professional Hong Kong market sentiment analyst. "
         "Analyze the movie comment. Return JSON with keys: "
@@ -479,8 +466,21 @@ async def run_all_analyses(df, deepseek_client):
     progress.empty()
     return results
 
+async def generate_summary(df, deepseek_client):
+    comments_preview = "\n".join(df["comment_text"].sample(min(50, len(df))).tolist())
+    prompt = f"Based on these comments about a movie, summarize the general sentiment and key discussion points in Traditional Chinese (Hong Kong style). Comments:\n{comments_preview}"
+    try:
+        response = await deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        return response.choices[0].message.content
+    except:
+        return "無法產生總結。"
+
 # =========================
-# 6. 主流程 (核心邏輯修改)
+# 6. 主流程
 # =========================
 
 def movie_comment_analysis(
@@ -502,17 +502,16 @@ def movie_comment_analysis(
         SEARCH_KEYWORDS, youtube_client, max_videos_per_keyword, start_date, end_date,
         add_language_bias=True, region_bias=True, max_total_videos=GLOBAL_MAX_VIDEOS
     )
-    if not video_ids: return None, "找不到相關影片。"
+    if not video_ids: return None, "找不到相關影片。", None
     
     # 2. 相關性過濾
     relevant_video_ids = asyncio.run(filter_videos_by_relevance(movie_title, video_ids, video_meta, deepseek_client))
-    if not relevant_video_ids: return None, "AI 過濾後無相關影片。"
+    if not relevant_video_ids: return None, "AI 過濾後無相關影片。", None
     
     # 3. 詳情與分數
     video_extra, channel_country_map = fetch_video_and_channel_details(relevant_video_ids, youtube_client)
     hk_score_map = {vid: compute_hk_video_score(vid, video_meta, video_extra, channel_country_map) for vid in relevant_video_ids}
     
-    # 排序
     sorted_ids = sorted(relevant_video_ids, key=lambda v: hk_score_map.get(v, 0), reverse=True) if prefer_hk_videos else relevant_video_ids
 
     # 4. 抓取留言
@@ -520,60 +519,46 @@ def movie_comment_analysis(
         sorted_ids, youtube_client, max_comments_per_video,
         video_meta, hk_score_map, video_extra, channel_country_map, GLOBAL_MAX_COMMENTS
     )
-    if df_comments.empty: return None, "找不到任何留言。"
+    if df_comments.empty: return None, "找不到任何留言。", None
 
-    st.info(f"已抓取 {len(df_comments)} 則原始留言，開始進行「情境式」篩選...")
+    st.info(f"已抓取 {len(df_comments)} 則原始留言，開始進行嚴格篩選（排除非 HK 頻道的非粵語留言）...")
 
-    # 5. 語言與情境篩選 (核心修改)
+    # 5. 語言與情境篩選 (更新邏輯)
     cc_t2s = OpenCC("t2s")
     cc_s2t = OpenCC("s2t")
     
-    # 計算特徵
     df_comments["lang_pred"] = df_comments["comment_text"].apply(lambda x: classify_zh_trad_simp(x, cc_t2s, cc_s2t))
     df_comments["cantonese_score"] = df_comments["comment_text"].apply(score_cantonese)
     
-    # 定義篩選邏輯
     def is_target_audience(row):
         text_score = row["cantonese_score"]
-        vid_score = row["video_hk_score"]
+        country = row["video_channel_country"] # e.g., 'HK', 'TW', 'US'
         lang = row["lang_pred"]
         
-        # 條件 A: 文本本身就是強粵語 (無論影片來源)
-        if text_score >= cantonese_threshold:
+        # 條件 A: 絕對優先 - 強粵語特徵 (Score >= 2.0)
+        # 無論頻道是哪國的，只要留言是強粵語，我們就收 (假設是海外港人)
+        if text_score >= 2.0:
             return True
             
-        # 條件 B: 影片是強香港背景 (分數 >= 3)，且留言是繁體中文、英文或未知中文
-        # 這能救回 "Thanks for sharing" 或 "謝謝分享"
-        if vid_score >= 3 and lang in ["zh-Hant", "zh-unkn", "en"]:
-            return True
-            
-        # 條件 C: 影片是中等香港背景 (分數 >= 1)，且留言是繁體中文 (稍微嚴格一點，不收英文)
-        if vid_score >= 1 and lang in ["zh-Hant", "zh-unkn"]:
-            # 如果文本分數稍微有一點 (例如有 "系" 或 "d")，也放行
-            if text_score >= 0.5:
+        # 條件 B: 頻道產地篩選
+        # 如果頻道是 'HK'，我們允許標準繁體中文、英文、或弱粵語
+        if country == 'HK':
+            if lang in ["zh-Hant", "zh-unkn", "en"]:
+                return True
+            if text_score >= 0.5: # 弱粵語
                 return True
                 
+        # 條件 C: 非 HK 頻道 (如 TW, US, CN)
+        # 這裡我們執行嚴格過濾：如果不是強粵語 (已經在 A 被抓走)，則全部丟棄
+        # 這意味著 TW 頻道的 "真的很好看" 會被丟棄，US 頻道的 "Good movie" 會被丟棄
+        # 只有 HK 頻道的 "Good movie" 會被保留
+        
         return False
 
-    # 初步篩選
     df_comments["is_target"] = df_comments.apply(is_target_audience, axis=1)
-    
-    # 排除簡體中文 (除非它有很高的粵語分數，例如廣東人打簡體粵語，但這裡我們假設簡體=非目標以保持純淨)
-    # 如果想保留廣東省粵語，可移除這行
-    df_comments = df_comments[df_comments["lang_pred"] != "zh-Hans"].reset_index(drop=True)
-    
     df_filtered = df_comments[df_comments["is_target"]].reset_index(drop=True)
 
-    # 自動放寬邏輯 (現在主要調整的是 text_score 的權重，或者如果樣本太少，我們可以降低 vid_score 的門檻)
-    # 這裡簡化為：如果樣本不夠，我們降低對 text_score 的依賴，更多依賴 video_score
-    if auto_relax_threshold and len(df_filtered) < target_min_cantonese:
-        st.info(f"樣本不足 ({len(df_filtered)})，嘗試放寬條件...")
-        # 放寬策略：只要影片有一點香港特徵 (score >= 1) 且是繁體/英文都收
-        mask_relaxed = (df_comments["video_hk_score"] >= 1) & (df_comments["lang_pred"].isin(["zh-Hant", "zh-unkn", "en"]))
-        df_filtered = df_comments[mask_relaxed].reset_index(drop=True)
-        st.info(f"放寬後樣本數：{len(df_filtered)}")
-
-    if df_filtered.empty: return None, "篩選後無符合條件的留言。"
+    if df_filtered.empty: return None, "篩選後無符合條件的留言。", None
 
     # 6. 日期與取樣
     df_filtered["published_at"] = pd.to_datetime(df_filtered["published_at"], utc=True, errors="coerce")
@@ -582,7 +567,7 @@ def movie_comment_analysis(
     end_dt = pd.to_datetime(end_date).tz_localize("Asia/Hong_Kong") + timedelta(days=1)
     df_filtered = df_filtered[(df_filtered["published_at_hk"] >= start_dt) & (df_filtered["published_at_hk"] < end_dt)].reset_index(drop=True)
     
-    if df_filtered.empty: return None, "日期範圍內無留言。"
+    if df_filtered.empty: return None, "日期範圍內無留言。", None
     
     df_analyze = df_filtered.sample(n=sample_size, random_state=42) if sample_size and 0 < sample_size < len(df_filtered) else df_filtered
     
@@ -591,7 +576,10 @@ def movie_comment_analysis(
     final_df = pd.concat([df_analyze.reset_index(drop=True), pd.DataFrame(analysis_results)], axis=1)
     final_df["published_at"] = pd.to_datetime(final_df["published_at"])
     
-    return final_df, None
+    # 8. 生成總結
+    ai_summary = asyncio.run(generate_summary(final_df, deepseek_client))
+    
+    return final_df, None, ai_summary
 
 # =========================
 # 7. UI
@@ -602,9 +590,11 @@ st.title("🎬 YouTube 電影評論 AI 情感分析（香港粵語優先）")
 
 with st.expander("使用說明"):
     st.markdown("""
-    **更新說明：**
-    *   已優化篩選邏輯：現在會保留 **香港影片** 底下的 **標準繁體中文** 和 **英文** 留言（例如 "Thanks for sharing" 或 "謝謝分享"）。
-    *   已增強粵語識別：支援 "系"、"9"、"d" 等常見網絡用語。
+    **篩選邏輯更新：**
+    1.  **強粵語保留**：無論頻道國家，只要留言包含強烈粵語口語特徵，一律保留。
+    2.  **產地嚴格過濾**：
+        *   **香港頻道 (HK)**：保留標準繁體中文、英文及粵語留言。
+        *   **非香港頻道 (TW, US, etc.)**：**剔除**標準中文與英文留言，僅保留強粵語留言。
     """)
 
 movie_title = st.text_input("電影名稱", value="九龍城寨之圍城")
@@ -618,33 +608,72 @@ st.subheader("進階設定")
 max_videos = st.slider("每個關鍵字搜尋數", 5, 80, 30)
 max_comments = st.slider("每部影片留言數", 10, 200, 80)
 sample_size = st.number_input("分析上限", 0, 5000, 500)
-cantonese_threshold = st.slider("粵語特徵分數門檻 (針對非香港頻道)", 0.5, 6.0, 2.0)
 
 if st.button("🚀 開始分析"):
     if not all([movie_title, yt_api_key, deepseek_api_key]):
         st.warning("請填寫所有欄位。")
     else:
         with st.spinner("AI 分析中..."):
-            df_result, err = movie_comment_analysis(
+            df_result, err, summary = movie_comment_analysis(
                 movie_title, str(start_date), str(end_date), yt_api_key, deepseek_api_key,
-                max_videos, max_comments, sample_size, cantonese_threshold=cantonese_threshold
+                max_videos, max_comments, sample_size
             )
         if err: st.error(err)
         else:
             st.success("完成！")
-            st.dataframe(df_result.head(20), use_container_width=True)
             
-            # 簡單圖表展示
+            # AI 總結
+            st.subheader("🤖 AI 評論總結")
+            st.info(summary)
+
+            # 數據預覽
+            st.dataframe(df_result.head(10), use_container_width=True)
+            
+            # 視覺化區域
+            st.markdown("---")
+            st.subheader("📊 數據視覺化")
+            
+            # Row 1: 情感分佈 & 主題分佈
             c1, c2 = st.columns(2)
             with c1:
-                st.subheader("情感分佈")
+                st.markdown("### 情感分佈")
                 vc = df_result['sentiment'].value_counts()
-                st.plotly_chart(px.pie(values=vc.values, names=vc.index, color=vc.index, 
-                                     color_discrete_map={'Positive':'#5cb85c','Negative':'#d9534f','Neutral':'#f0ad4e'}), use_container_width=True)
+                fig_pie = px.pie(values=vc.values, names=vc.index, color=vc.index, 
+                               color_discrete_map={'Positive':'#5cb85c','Negative':'#d9534f','Neutral':'#f0ad4e'})
+                st.plotly_chart(fig_pie, use_container_width=True)
+                
             with c2:
-                st.subheader("主題分佈")
+                st.markdown("### 討論主題分佈")
                 df_topic = df_result[df_result['topic'] != 'N/A']
                 if not df_topic.empty:
-                    st.plotly_chart(px.bar(df_topic['topic'].value_counts(), orientation='h'), use_container_width=True)
+                    topic_counts = df_topic['topic'].value_counts().reset_index()
+                    topic_counts.columns = ['Topic', 'Count']
+                    fig_bar = px.bar(topic_counts, x='Count', y='Topic', orientation='h', color='Count', color_continuous_scale='Blues')
+                    fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
+                    st.plotly_chart(fig_bar, use_container_width=True)
+
+            # Row 2: 時間趨勢
+            st.markdown("### 📅 情感趨勢變化")
+            df_result['date_only'] = df_result['published_at'].dt.date
+            trend_data = df_result.groupby(['date_only', 'sentiment']).size().reset_index(name='count')
+            fig_line = px.line(trend_data, x='date_only', y='count', color='sentiment', 
+                             color_discrete_map={'Positive':'#5cb85c','Negative':'#d9534f','Neutral':'#f0ad4e'},
+                             markers=True)
+            st.plotly_chart(fig_line, use_container_width=True)
+
+            # Row 3: 熱門關鍵字 (簡單斷詞)
+            st.markdown("### 🔑 熱門關鍵詞")
+            # 簡單的停用詞過濾
+            stopwords = set(['的', '了', '是', '我', '你', '他', '都', '就', '在', '也', '有', '去', '好', '睇', '人', '片', '電影', '真', '係', '唔', '咁', '點', '既', '嘅', '咗'])
+            all_text = "".join(df_result['comment_text'].tolist())
+            # 簡單的 n-gram 或結巴分詞這裡用正則簡單切分中文詞
+            words = re.findall(r'[\u4e00-\u9fa5]{2,}', all_text)
+            filtered_words = [w for w in words if w not in stopwords]
+            word_counts = Counter(filtered_words).most_common(20)
+            
+            if word_counts:
+                wc_df = pd.DataFrame(word_counts, columns=['Word', 'Frequency'])
+                fig_wc = px.bar(wc_df, x='Word', y='Frequency', color='Frequency', color_continuous_scale='Greens')
+                st.plotly_chart(fig_wc, use_container_width=True)
 
             st.download_button("📥 下載 CSV", df_result.to_csv(index=False, encoding='utf-8-sig'), f"{movie_title}_analysis.csv", "text/csv")
