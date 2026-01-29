@@ -194,16 +194,15 @@ def get_all_comments_cached(video_ids, youtube_client, max_per_video, max_total_
     return pd.DataFrame(all_comments)
 
 # =========================
-# 2. DeepSeek 分析 (Prompt 再次增強：防止政治隱喻干擾)
+# 2. DeepSeek 分析 (修复 RuntimeError 版)
 # =========================
 
-async def analyze_comment_deepseek_v2(row, deepseek_client, semaphore):
+async def analyze_comment_deepseek_v2(row, client, semaphore):
+    """
+    單個評論分析函數
+    """
     text = row["comment_text"]
     video_title = row.get("video_title", "")
-    
-    # Prompt 策略：
-    # 增加 Context：告訴 AI 這條評論來自哪個視頻標題，幫助判斷
-    # 增加規則：如果評論是在討論政治而非電影本身，也視為 False
     
     system_prompt = (
         "You are a movie analyst focusing on the Hong Kong market. "
@@ -223,7 +222,8 @@ async def analyze_comment_deepseek_v2(row, deepseek_client, semaphore):
 
     async with semaphore:
         try:
-            response = await deepseek_client.chat.completions.create(
+            # 設置超時，防止卡死
+            response = await client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -231,30 +231,61 @@ async def analyze_comment_deepseek_v2(row, deepseek_client, semaphore):
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,
+                timeout=15  # 增加超時設定
             )
-            return json.loads(response.choices[0].message.content)
-        except:
-            return {"sentiment": "Error", "keywords": "", "is_target_audience": False}
+            content = response.choices[0].message.content
+            if not content:
+                return {"sentiment": "Error", "keywords": "", "is_target_audience": False}
+            return json.loads(content)
+        except Exception as e:
+            # 捕捉錯誤但不中斷程序，返回默認失敗值
+            return {"sentiment": "Error", "keywords": f"Error: {str(e)}", "is_target_audience": False}
 
-async def run_deepseek_analysis(df, deepseek_client):
-    semaphore = asyncio.Semaphore(50)
+async def run_deepseek_analysis(df, api_key):
+    """
+    主異步控制器：負責初始化 Client 和管理併發
+    """
+    # === 關鍵修復：在異步函數內部初始化 Client ===
+    # 這樣可以確保 Client 綁定到正確的 Event Loop
+    client = openai.AsyncOpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+    
+    semaphore = asyncio.Semaphore(20) # 降低併發數以求穩定 (50 -> 20)
     rows = df.to_dict('records')
-    tasks = [analyze_comment_deepseek_v2(row, deepseek_client, semaphore) for row in rows]
     
     progress_bar = st.progress(0, text="AI 正在分析 (已啟用政治內容過濾)...")
     
+    # 創建任務列表
+    tasks = [analyze_comment_deepseek_v2(row, client, semaphore) for row in rows]
+    
+    # 執行任務並更新進度條
     results = []
     total = len(tasks)
+    
+    # 使用 as_completed 更新進度條
     for i, task in enumerate(asyncio.as_completed(tasks)):
-        await task
+        await task # 等待任意一個完成
         progress_bar.progress((i + 1) / total)
-        
-    results = await asyncio.gather(*tasks)
+    
+    # === 關鍵修復：收集結果並容錯 ===
+    # return_exceptions=True 確保即使某個任務報錯，也不會拋出 RuntimeError
+    results_raw = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # 清理：關閉 Client 連接
+    await client.close()
     progress_bar.empty()
-    return pd.DataFrame(results)
+    
+    # 處理可能的異常結果
+    clean_results = []
+    for res in results_raw:
+        if isinstance(res, Exception):
+            clean_results.append({"sentiment": "Error", "keywords": "System Error", "is_target_audience": False})
+        else:
+            clean_results.append(res)
+            
+    return pd.DataFrame(clean_results)
 
 # =========================
-# 3. 主流程
+# 3. 主流程 (修復版)
 # =========================
 
 def main_process(movie_title, start_date, end_date, yt_api_key, deepseek_api_key, 
@@ -262,7 +293,7 @@ def main_process(movie_title, start_date, end_date, yt_api_key, deepseek_api_key
                  negative_keywords):
     
     youtube = build("youtube", "v3", developerKey=yt_api_key)
-    deepseek = openai.AsyncOpenAI(api_key=deepseek_api_key, base_url="https://api.deepseek.com/v1")
+    # 注意：這裡不再初始化 DeepSeek Client，改在異步函數內部初始化
     
     # 1. 搜尋 (傳入負面關鍵詞)
     keywords = generate_search_queries(movie_title)
@@ -284,11 +315,19 @@ def main_process(movie_title, start_date, end_date, yt_api_key, deepseek_api_key
         return None, "這些影片下沒有找到留言。"
     
     # 3. AI 分析
-    analysis_df = asyncio.run(run_deepseek_analysis(df_comments, deepseek))
+    try:
+        # === 關鍵修復：傳入 API Key 字符串 ===
+        analysis_df = asyncio.run(run_deepseek_analysis(df_comments, deepseek_api_key))
+    except Exception as e:
+        return None, f"AI 分析過程中發生錯誤: {str(e)}"
+
     final_df = pd.concat([df_comments, analysis_df], axis=1)
     
     # 4. 篩選
     original_len = len(final_df)
+    # 確保 is_target_audience 是布林值，防止 AI 返回錯誤格式導致報錯
+    final_df["is_target_audience"] = final_df["is_target_audience"].fillna(False).astype(bool)
+    
     final_df = final_df[final_df["is_target_audience"] == True].copy()
     filtered_len = len(final_df)
     
