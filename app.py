@@ -194,7 +194,7 @@ def get_all_comments_cached(video_ids, youtube_client, max_per_video, max_total_
     return pd.DataFrame(all_comments)
 
 # =========================
-# 2. DeepSeek 分析 (修复 RuntimeError 版)
+# 2. DeepSeek 分析 (放宽标准 & 调试版)
 # =========================
 
 async def analyze_comment_deepseek_v2(row, client, semaphore):
@@ -204,25 +204,27 @@ async def analyze_comment_deepseek_v2(row, client, semaphore):
     text = row["comment_text"]
     video_title = row.get("video_title", "")
     
+    # === 修改 1: 放寬 System Prompt，並要求返回 reason ===
     system_prompt = (
-        "You are a movie analyst focusing on the Hong Kong market. "
-        f"The comment is from a video titled: '{video_title}'. "
+        "You are a lenient movie analyst for the Hong Kong market. "
+        f"The comment is from a video: '{video_title}'. "
         "Analyze the comment. "
         "Output JSON with keys: "
         "'sentiment' (Positive/Negative/Neutral), "
-        "'keywords' (Extract 1-2 main keywords in Traditional Chinese), "
-        "'is_target_audience' (boolean). "
+        "'keywords' (Extract 1-2 main keywords), "
+        "'is_target_audience' (boolean), "
+        "'reason' (Short string explaining why is_target_audience is true/false). "
         "\n\n"
-        "Rules for 'is_target_audience':\n"
-        "1. **TRUE** if it is a relevant movie review/reaction in Cantonese, Traditional Chinese, or mixed English.\n"
-        "2. **FALSE** if it is purely about politics (e.g., discussing government policies, CCP, democracy) without relating to the movie plot.\n"
-        "3. **FALSE** if it is Simplified Chinese (unless clearly HK slang).\n"
-        "4. **FALSE** if it is spam or ads."
+        "Rules for 'is_target_audience' (BE LENIENT):\n"
+        "1. **TRUE** if it expresses ANY opinion about the movie, actors, or the video content.\n"
+        "2. **TRUE** even if it is Simplified Chinese, as long as it is readable.\n"
+        "3. **TRUE** even if it mentions politics, AS LONG AS it relates to the movie's themes or context.\n"
+        "4. **TRUE** for short comments like 'Good', 'Bad', 'Support'.\n"
+        "5. **FALSE** ONLY if it is clearly spam, advertisements, or completely gibberish/unrelated nonsense."
     )
 
     async with semaphore:
         try:
-            # 設置超時，防止卡死
             response = await client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
@@ -231,92 +233,73 @@ async def analyze_comment_deepseek_v2(row, client, semaphore):
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,
-                timeout=15  # 增加超時設定
+                timeout=20 
             )
             content = response.choices[0].message.content
             if not content:
-                return {"sentiment": "Error", "keywords": "", "is_target_audience": False}
-            return json.loads(content)
+                # 如果內容為空，默認保留 (True)，以免誤刪
+                return {"sentiment": "Neutral", "keywords": "Empty Response", "is_target_audience": True, "reason": "API returned empty"}
+            
+            result = json.loads(content)
+            
+            # === 修改 2: 強制類型轉換，防止 AI 返回字符串 "true" 導致過濾失敗 ===
+            is_target = result.get("is_target_audience", True)
+            if isinstance(is_target, str):
+                is_target = is_target.lower() == 'true'
+            result["is_target_audience"] = is_target
+            
+            # 確保有 reason 字段
+            if "reason" not in result:
+                result["reason"] = "No reason provided"
+                
+            return result
+
+        except json.JSONDecodeError:
+            # JSON 解析失敗，通常是因為 AI 輸出了多餘文字，我們選擇保留這條評論人工查看
+            return {"sentiment": "Neutral", "keywords": "JSON Error", "is_target_audience": True, "reason": "JSON Parse Error"}
         except Exception as e:
-            # 捕捉錯誤但不中斷程序，返回默認失敗值
-            return {"sentiment": "Error", "keywords": f"Error: {str(e)}", "is_target_audience": False}
+            # 其他錯誤 (網絡等)，也默認保留 (True)
+            return {"sentiment": "Error", "keywords": "System Error", "is_target_audience": True, "reason": f"Error: {str(e)}"}
 
 async def run_deepseek_analysis(df, api_key):
     """
-    主異步控制器：負責初始化 Client 和管理併發
+    主異步控制器
     """
-    # === 關鍵修復：在異步函數內部初始化 Client ===
-    # 這樣可以確保 Client 綁定到正確的 Event Loop
     client = openai.AsyncOpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
     
-    semaphore = asyncio.Semaphore(20) # 降低併發數以求穩定 (50 -> 20)
+    # 降低併發數保證穩定性
+    semaphore = asyncio.Semaphore(10) 
     rows = df.to_dict('records')
     
-    progress_bar = st.progress(0, text="AI 正在分析 (已啟用政治內容過濾)...")
+    progress_bar = st.progress(0, text="AI 正在深度分析 (已放寬過濾標準)...")
     
-    # 創建任務列表
     tasks = [analyze_comment_deepseek_v2(row, client, semaphore) for row in rows]
     
-    # 執行任務並更新進度條
     results = []
     total = len(tasks)
     
-    # 使用 as_completed 更新進度條
     for i, task in enumerate(asyncio.as_completed(tasks)):
-        await task # 等待任意一個完成
+        await task 
         progress_bar.progress((i + 1) / total)
     
-    # === 關鍵修復：收集結果並容錯 ===
-    # return_exceptions=True 確保即使某個任務報錯，也不會拋出 RuntimeError
     results_raw = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # 清理：關閉 Client 連接
     await client.close()
     progress_bar.empty()
     
-    # 處理可能的異常結果
     clean_results = []
     for res in results_raw:
         if isinstance(res, Exception):
-            clean_results.append({"sentiment": "Error", "keywords": "System Error", "is_target_audience": False})
+            # 嚴重錯誤時，保留數據並標記
+            clean_results.append({"sentiment": "Error", "keywords": "Critical Fail", "is_target_audience": True, "reason": str(res)})
         else:
             clean_results.append(res)
             
     return pd.DataFrame(clean_results)
-
-# =========================
-# 3. 主流程 (修復版)
-# =========================
-
-def main_process(movie_title, start_date, end_date, yt_api_key, deepseek_api_key, 
-                 max_per_keyword, max_total_videos, max_per_video, max_total_comments,
-                 negative_keywords):
-    
-    youtube = build("youtube", "v3", developerKey=yt_api_key)
-    # 注意：這裡不再初始化 DeepSeek Client，改在異步函數內部初始化
-    
-    # 1. 搜尋 (傳入負面關鍵詞)
-    keywords = generate_search_queries(movie_title)
-    video_ids, video_meta = search_youtube_videos_smart(
-        keywords, youtube, movie_title,
-        max_per_keyword, max_total_videos, start_date, end_date,
-        negative_keywords
-    )
-    
-    if not video_ids:
-        return None, f"找不到相關影片。請檢查電影名稱，或嘗試減少負面關鍵詞。"
-    
-    st.info(f"過濾政治/無關內容後，鎖定 {len(video_ids)} 部影片，開始抓取留言...")
-    
-    # 2. 抓取
-    df_comments = get_all_comments_cached(video_ids, youtube, max_per_video, max_total_comments, video_meta)
-    
-    if df_comments.empty:
-        return None, "這些影片下沒有找到留言。"
+# ... (前面代码不变) ...
     
     # 3. AI 分析
     try:
-        # === 關鍵修復：傳入 API Key 字符串 ===
         analysis_df = asyncio.run(run_deepseek_analysis(df_comments, deepseek_api_key))
     except Exception as e:
         return None, f"AI 分析過程中發生錯誤: {str(e)}"
@@ -325,17 +308,28 @@ def main_process(movie_title, start_date, end_date, yt_api_key, deepseek_api_key
     
     # 4. 篩選
     original_len = len(final_df)
-    # 確保 is_target_audience 是布林值，防止 AI 返回錯誤格式導致報錯
-    final_df["is_target_audience"] = final_df["is_target_audience"].fillna(False).astype(bool)
     
-    final_df = final_df[final_df["is_target_audience"] == True].copy()
-    filtered_len = len(final_df)
+    # 確保是布林值
+    final_df["is_target_audience"] = final_df["is_target_audience"].fillna(True).astype(bool)
     
-    st.success(f"分析完成！原始抓取 {original_len} 則，AI 剔除非港式/政治離題內容後，剩餘 {filtered_len} 則有效評論。")
+    # === 调试模式：先不删除，看看数据 ===
+    # 如果你发现还是 0，可以暂时注释掉下面这一行过滤代码，看看 reason 写的是什么
+    final_df_filtered = final_df[final_df["is_target_audience"] == True].copy()
     
-    final_df["published_at"] = pd.to_datetime(final_df["published_at"])
-    return final_df, None
+    filtered_len = len(final_df_filtered)
+    
+    if filtered_len == 0 and original_len > 0:
+        st.warning("警告：所有評論都被 AI 過濾掉了。以下是前 5 條被拒絕的原因，請檢查：")
+        st.write(final_df[["comment_text", "reason"]].head())
+        # 為了讓你能看到數據，這種情況下我們返回原始數據
+        return final_df, "所有數據被過濾，已返回原始數據供調試。"
 
+    st.success(f"分析完成！原始 {original_len} 則，有效 {filtered_len} 則。")
+    
+    final_df_filtered["published_at"] = pd.to_datetime(final_df_filtered["published_at"])
+    
+    # 返回包含 reason 的數據，方便你在 UI 上查看
+    return final_df_filtered, None
 # =========================
 # 4. UI
 # =========================
